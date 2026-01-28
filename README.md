@@ -37,15 +37,49 @@ Los textos utilizados provienen de Project Gutenberg:
 
 ```text
 bot-literario/
+│
 ├── backend/
-│   ├── app.py          # Servidor Flask (puerto 8090)
-│   ├── cargar.py       # Carga de libros (load_documents)
-│   ├── ask.py          # Lógica de preguntas
-│   └── data/
-│       ├── raw/        # Libros TXT originales
-│       └── processed/ # Datos procesados
+│   ├── app.py
+│   ├── cargar.py
+│   ├── ask.py
+│   ├── database.py
+│   ├── config.py
+│   ├── requirements.txt
+│   │
+│   ├── data/
+│   │   ├── raw/
+│   │   │   ├── iliada.txt
+│   │   │   ├── principe.txt
+│   │   │   └── mas_alla_bien_mal.txt
+│   │   │
+│   │   └── processed/
+│   │
+│   └── venv/  1000 por sinpe y lo compartimos 
 │
 ├── frontend/
-│   └── src/            # Aplicación web tipo chatbot
+│   ├── node_modules/ Necesario descargar en local
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── Chat.jsx
+│   │   │   ├── Message.jsx
+│   │   │   └── InputBox.jsx
+│   │   │
+│   │   ├── services/
+│   │   │   └── api.js
+│   │   │
+│   │   ├── styles/
+│   │   │   └── chat.css
+│   │   │
+│   │   ├── App.jsx
+│   │   └── main.jsx
+│   │
+│   ├── index.html
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── vite.config.js
+│   └── eslint.config.js
 │
-└── README.md
+├── README.md
+└── .gitignore
+
