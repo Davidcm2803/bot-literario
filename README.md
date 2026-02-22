@@ -38,23 +38,38 @@ Los textos utilizados provienen de Project Gutenberg:
 ```text
 bot-literario/
 │
-├── backend/
-│   ├── app.py
-│   ├── cargar.py
-│   ├── ask.py
-│   ├── database.py
-│   ├── config.py
-│   ├── requirements.txt
-│   │
-│   ├── data/
-│   │   ├── raw/
-│   │   │   ├── iliada.txt
-│   │   │   ├── principe.txt
-│   │   │   └── mas_alla_bien_mal.txt
-│   │   │
-│   │   └── processed/
-│   │
-│   └── venv/  1000 por sinpe y lo compartimos 
+backend/
+├── books/                  # Carpeta con los libros en .txt
+│   ├── The Project Gutenberg Book 1.txt
+│   └── The Project Gutenberg Book 2.txt
+│
+├── DB/
+│   └── docker-compose.yaml # Configuración de Weaviate en Docker
+│
+├── models/                 # Lógica de negocio y modelos para Weaviate
+│   ├── __pycache__/
+│   ├── books.py
+│   ├── schema.py
+│   ├── test.py
+│   └── upload_books.py
+│   └── user.py
+│
+├── routes/                 # Rutas de Flask
+│   ├── __init__.py
+│   ├── bot_routes.py
+│   └── user_routes.py
+│
+├── services/               # Servicios y lógica adicional
+│   ├── __init__.py
+│   ├── load_service.py
+│   ├── rag_service.py
+│   ├── user_service.py
+│   └── weaviate_service.py
+│
+├── venv/                   # Entorno virtual
+│
+├── app.py                  # Aplicación principal de Flask
+└── requirements.txt        # Dependencias del proyecto
 │
 ├── frontend/
 │   ├── node_modules/ Necesario descargar en local
