@@ -1,0 +1,32 @@
+version: "3.9"  # Versión del formato de Docker Compose
+
+services:
+
+  weaviate:
+    image: semitechnologies/weaviate:latest  # Imagen oficial de Weaviate
+    container_name: weaviate               # Nombre del contenedor
+    restart: unless-stopped                # Se reinicia automáticamente si se cae
+
+    ports:
+      - "8080:8080"  # Expone el puerto 8080 (API de Weaviate) ESTO ES INDEPENDIENTE DE EL PUERTO PEDIDO PARA FLASK
+
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25  # Máximo de resultados por búsqueda si no se especifica límite
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"  # Permite acceso sin login (solo desarrollo)
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"  # Ruta donde se guardan los datos
+      DEFAULT_VECTORIZER_MODULE: "text2vec-transformers"  # Módulo que convierte texto en vectores
+      ENABLE_MODULES: "text2vec-transformers"  # Activa el módulo de embeddings
+      TRANSFORMERS_INFERENCE_API: "http://t2v-transformers:8080"  # Conecta con el contenedor que genera los embeddings
+
+    volumes:
+      - weaviate_data:/var/lib/weaviate  # Guarda los datos aunque apagues el contenedor
+
+  t2v-transformers:
+    image: semitechnologies/transformers-inference:sentence-transformers-all-MiniLM-L6-v2  
+    # Modelo que convierte texto en vectores (embeddings)
+
+    environment:
+      ENABLE_CUDA: "0"  # 0 = usa CPU (si tuvieras GPU sería 1)
+
+volumes:
+  weaviate_data:  # Volumen persistente para guardar la base de datos
