@@ -18,6 +18,10 @@ def _clean_text(raw: str) -> tuple[str, dict]:
         "year": 0,
     }
 
+    # elimina caracteres corruptos o invalidos antes de procesar
+    # solo conserva latin basico, latin extendido y espacios comunes
+    raw = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF\u0100-\u024F]', '', raw)
+
     # busca campos clave en el encabezado usando expresiones regulares
     title_match = re.search(r"Title:\s*(.+)", raw, re.IGNORECASE)
     author_match = re.search(r"Author:\s*(.+)", raw, re.IGNORECASE)
@@ -32,6 +36,16 @@ def _clean_text(raw: str) -> tuple[str, dict]:
         metadata["language"] = language_match.group(1).strip()
     if year_match:
         metadata["year"] = int(year_match.group(1))
+
+    # si no encontro formato gutenberg, usa las primeras lineas no vacias como fallback
+    # asume que la primera linea es el titulo y la segunda es el autor
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+
+    if metadata["title"] == "Desconocido" and len(lines) > 0:
+        metadata["title"] = lines[0]
+
+    if metadata["author"] == "Desconocido" and len(lines) > 1:
+        metadata["author"] = lines[1]
 
     # marcadores que indican donde empieza el contenido real del libro
     start_markers = [
@@ -112,7 +126,8 @@ def book_exists(client: weaviate.Client, title: str, author: str) -> bool:
 def upload_book(client: weaviate.Client, txt_path: str) -> dict:
     # carga un libro txt en weaviate y crea sus chunks
 
-    with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+    # errors ignore descarta bytes invalidos en vez de reemplazarlos con caracteres corruptos
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         raw = f.read()
 
     text, metadata = _clean_text(raw)
