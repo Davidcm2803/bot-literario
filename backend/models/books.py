@@ -3,17 +3,14 @@ import re
 import uuid
 import weaviate
 
+# tamano de cada chunk y cuanto texto se repite entre chunks
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 100
 
-#  Configuración de chunking
-CHUNK_SIZE = 1000      # Palabras por chunk
-CHUNK_OVERLAP = 100    # Palabras de solapamiento entre chunks
 
+def _clean_text(raw: str) -> tuple[str, dict]:
+    # extrae metadata del encabezado de los libros de project gutenberg
 
-def _clean_gutenberg_text(raw: str) -> tuple[str, dict]:
-    """
-    Limpia el texto de Proyecto Gutenberg y extrae metadata básica.
-    Devuelve (texto_limpio, metadata_dict).
-    """
     metadata = {
         "title": "Desconocido",
         "author": "Desconocido",
@@ -21,7 +18,11 @@ def _clean_gutenberg_text(raw: str) -> tuple[str, dict]:
         "year": 0,
     }
 
-    # Intentar extraer metadata del encabezado de Gutenberg
+    # elimina caracteres corruptos o invalidos antes de procesar
+    # solo conserva latin basico, latin extendido y espacios comunes
+    raw = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF\u0100-\u024F]', '', raw)
+
+    # busca campos clave en el encabezado usando expresiones regulares
     title_match = re.search(r"Title:\s*(.+)", raw, re.IGNORECASE)
     author_match = re.search(r"Author:\s*(.+)", raw, re.IGNORECASE)
     language_match = re.search(r"Language:\s*(.+)", raw, re.IGNORECASE)
@@ -36,30 +37,44 @@ def _clean_gutenberg_text(raw: str) -> tuple[str, dict]:
     if year_match:
         metadata["year"] = int(year_match.group(1))
 
-    # Eliminar encabezado y pie de Gutenberg
+    # si no encontro formato gutenberg, usa las primeras lineas no vacias como fallback
+    # asume que la primera linea es el titulo y la segunda es el autor
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+
+    if metadata["title"] == "Desconocido" and len(lines) > 0:
+        metadata["title"] = lines[0]
+
+    if metadata["author"] == "Desconocido" and len(lines) > 1:
+        metadata["author"] = lines[1]
+
+    # marcadores que indican donde empieza el contenido real del libro
     start_markers = [
         r"\*\*\* START OF (THE|THIS) PROJECT GUTENBERG",
         r"\*\*\* BEGIN OF (THE|THIS) PROJECT GUTENBERG",
     ]
+    # marcadores que indican donde termina el contenido real del libro
     end_markers = [
         r"\*\*\* END OF (THE|THIS) PROJECT GUTENBERG",
         r"\*\*\* END OF THE PROJECT GUTENBERG",
     ]
 
     text = raw
+
+    # recorta el encabezado de gutenberg, se queda solo con lo que viene despues del marcador de inicio
     for marker in start_markers:
         parts = re.split(marker, text, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
             text = parts[-1]
             break
 
+    # recorta el pie de pagina de gutenberg, se queda solo con lo que viene antes del marcador de fin
     for marker in end_markers:
         parts = re.split(marker, text, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
             text = parts[0]
             break
 
-    # Limpiar espacios excesivos
+    # normaliza saltos de linea para evitar espacios en blanco excesivos
     text = re.sub(r"\r\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip()
@@ -68,9 +83,8 @@ def _clean_gutenberg_text(raw: str) -> tuple[str, dict]:
 
 
 def _split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """
-    Divide el texto en chunks de `chunk_size` palabras con `overlap` de solapamiento.
-    """
+    # divide el texto en fragmentos para vectorizarlos en weaviate
+
     words = text.split()
     chunks = []
     start = 0
@@ -79,14 +93,18 @@ def _split_into_chunks(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = C
         end = start + chunk_size
         chunk = " ".join(words[start:end])
         chunks.append(chunk)
+
+        # el overlap hace que cada chunk comparta palabras con el anterior
+        # esto evita que el contexto se pierda en los bordes de los chunks
         start += chunk_size - overlap
 
     return chunks
 
-#  Funciones principales 
 
 def book_exists(client: weaviate.Client, title: str, author: str) -> bool:
-    """Verifica si un libro ya existe en Weaviate para evitar duplicados."""
+    # verifica si el libro ya esta guardado en la base
+
+    # filtra por titulo Y autor para evitar falsos positivos con titulos repetidos
     result = (
         client.query
         .get("Book", ["title", "author"])
@@ -100,23 +118,21 @@ def book_exists(client: weaviate.Client, title: str, author: str) -> bool:
         .with_limit(1)
         .do()
     )
+
     books = result.get("data", {}).get("Get", {}).get("Book", [])
     return len(books) > 0
 
 
 def upload_book(client: weaviate.Client, txt_path: str) -> dict:
-    """
-    Lee un archivo .txt de Gutenberg, extrae metadata, crea el objeto Book
-    y sube todos sus chunks como objetos BookChunk en Weaviate.
+    # carga un libro txt en weaviate y crea sus chunks
 
-    Devuelve un dict con el resultado de la operación.
-    """
-    with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+    # errors ignore descarta bytes invalidos en vez de reemplazarlos con caracteres corruptos
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
         raw = f.read()
 
-    text, metadata = _clean_gutenberg_text(raw)
+    text, metadata = _clean_text(raw)
 
-    # Evitar duplicados
+    # si el libro ya existe se omite para no duplicar chunks en weaviate
     if book_exists(client, metadata["title"], metadata["author"]):
         return {
             "status": "skipped",
@@ -124,8 +140,9 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
             "reason": "Ya existe en la base de datos",
         }
 
-    # Crear objeto Book
     book_id = str(uuid.uuid4())
+
+    # crea el objeto libro principal sin el contenido, solo los metadatos
     client.data_object.create(
         data_object={
             "title": metadata["title"],
@@ -137,15 +154,18 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
         uuid=book_id,
     )
 
-    # Crear objetos BookChunk 
     chunks = _split_into_chunks(text)
-    chunk_ids = []
 
+    # el batch agrupa multiples operaciones en una sola peticion a weaviate
+    # es mucho mas rapido que insertar chunk por chunk de forma individual
     with client.batch as batch:
-        batch.batch_size = 50  # Enviar de 50 en 50 para no saturar
+        batch.batch_size = 20
 
         for idx, chunk_text in enumerate(chunks):
+
             chunk_id = str(uuid.uuid4())
+
+            # inserta el chunk con su texto y posicion dentro del libro
             batch.add_data_object(
                 data_object={
                     "content": chunk_text,
@@ -154,17 +174,16 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
                 class_name="BookChunk",
                 uuid=chunk_id,
             )
-            chunk_ids.append((chunk_id, idx))
 
-    # Crear referencias BookChunk a Book
-    for chunk_id, _ in chunk_ids:
-        client.data_object.reference.add(
-            from_class_name="BookChunk",
-            from_uuid=chunk_id,
-            from_property_name="book",
-            to_class_name="Book",
-            to_uuid=book_id,
-        )
+            # la referencia enlaza cada chunk con su libro padre
+            # esto permite recuperar los metadatos del libro al buscar chunks
+            batch.add_reference(
+                from_object_class_name="BookChunk",
+                from_object_uuid=chunk_id,
+                from_property_name="book",
+                to_object_class_name="Book",
+                to_object_uuid=book_id,
+            )
 
     return {
         "status": "uploaded",
@@ -178,12 +197,8 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
 
 
 def upload_all_books(client: weaviate.Client, books_folder: str = "books") -> list[dict]:
-    """
-    Recorre la carpeta `books_folder`, carga todos los archivos .txt
-    y los sube a Weaviate.
+    # carga todos los libros txt de una carpeta
 
-    Devuelve una lista con el resultado de cada archivo.
-    """
     if not os.path.isdir(books_folder):
         raise FileNotFoundError(f"La carpeta '{books_folder}' no existe.")
 
@@ -193,26 +208,31 @@ def upload_all_books(client: weaviate.Client, books_folder: str = "books") -> li
         return [{"status": "empty", "reason": f"No se encontraron archivos .txt en '{books_folder}'"}]
 
     results = []
+
     for filename in txt_files:
+
         filepath = os.path.join(books_folder, filename)
+
         print(f"  Procesando: {filename} ...")
+
         try:
             result = upload_book(client, filepath)
             result["file"] = filename
             results.append(result)
-            print(f"    → {result['status'].upper()}: {result.get('title', '?')}")
+            print(f"    -> {result['status'].upper()}: {result.get('title', '?')}")
+
         except Exception as e:
             results.append({"status": "error", "file": filename, "error": str(e)})
-            print(f"    → ERROR en {filename}: {e}")
+            print(f"    -> ERROR en {filename}: {e}")
 
     return results
 
 
 def search_books(client: weaviate.Client, query: str, limit: int = 5) -> list[dict]:
-    """
-    Realiza una búsqueda vectorial sobre los chunks de libros.
-    Devuelve los chunks más relevantes con su referencia al libro.
-    """
+    # busqueda semantica de chunks usando vectores
+
+    # with_near_text convierte la query en un vector y busca los chunks mas cercanos
+    # la distancia resultante indica que tan relevante es cada chunk (menor = mejor)
     result = (
         client.query
         .get("BookChunk", ["content", "chunk_index", "book { ... on Book { title author } }"])
@@ -223,11 +243,13 @@ def search_books(client: weaviate.Client, query: str, limit: int = 5) -> list[di
     )
 
     chunks = result.get("data", {}).get("Get", {}).get("BookChunk", [])
+
     return chunks
 
 
 def list_books(client: weaviate.Client) -> list[dict]:
-    """Lista todos los libros almacenados en Weaviate."""
+    # lista los libros almacenados en la base
+
     result = (
         client.query
         .get("Book", ["title", "author", "year", "language"])
@@ -235,12 +257,15 @@ def list_books(client: weaviate.Client) -> list[dict]:
         .with_limit(100)
         .do()
     )
+
     return result.get("data", {}).get("Get", {}).get("Book", [])
 
 
 def delete_book(client: weaviate.Client, book_id: str) -> bool:
-    """Elimina un libro y todos sus chunks asociados."""
-    # Primero buscar los chunks de este libro
+    # elimina un libro y todos sus chunks asociados
+
+    # primero busca todos los chunks que pertenecen a este libro
+    # hay que borrarlos antes que el libro para no dejar huerfanos en weaviate
     result = (
         client.query
         .get("BookChunk", ["chunk_index"])
@@ -253,12 +278,13 @@ def delete_book(client: weaviate.Client, book_id: str) -> bool:
         .with_limit(10000)
         .do()
     )
+
     chunks = result.get("data", {}).get("Get", {}).get("BookChunk", [])
 
-    # Eliminar chunks
+    # borra cada chunk individualmente antes de eliminar el libro padre
     for chunk in chunks:
         client.data_object.delete(chunk["_additional"]["id"], class_name="BookChunk")
 
-    # Eliminar el libro
     client.data_object.delete(book_id, class_name="Book")
+
     return True
