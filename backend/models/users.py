@@ -8,9 +8,9 @@ import weaviate
 
 
 #  Configuración JWT
-JWT_SECRET = os.environ.get("JWT_SECRET", "cambia_este_secreto_en_produccion")
+JWT_SECRET = os.environ.get("JWT_SECRET", "cambia_este_secreto_en_produccion")# ponerlo en el .env
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_HOURS = 24  # El token dura 24 horas
+JWT_EXPIRATION_HOURS = 24  # El token dura 24 horas, DEBE CAMBIARSE
 
 
 #  Hash de contraseña
@@ -49,10 +49,7 @@ def _generate_token(user_id: str, username: str) -> str:
 
 
 def verify_token(token: str) -> dict | None:
-    """
-    Verifica y decodifica un JWT.
-    Devuelve el payload si es válido, None si expiró o es inválido.
-    """
+    """ Verifica y decodifica un JWT, devuelve el payload si es válido, None si expiró o es invalido. """
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return payload
@@ -65,7 +62,7 @@ def verify_token(token: str) -> dict | None:
 #  Creacion de usuario en Weaviate
 
 def user_exists(client: weaviate.Client, username: str = None, email: str = None) -> bool:
-    """Verifica si ya existe un usuario con ese username o email."""
+    """ Verifica si ya existe un usuario con ese username o email."""
     filters = []
 
     if username:
@@ -106,13 +103,7 @@ def _get_user_by_username(client: weaviate.Client, username: str) -> dict | None
 #  API pública de usuarios
 
 def register_user(client: weaviate.Client, username: str, email: str, password: str) -> dict:
-    """
-    Registra un nuevo usuario en Weaviate.
-
-    Devuelve:
-        {"success": True, "user_id": "...", "username": "..."}
-        {"success": False, "error": "mensaje de error"}
-    """
+    """Registra un nuevo usuario en Weaviate"""
     # Validaciones básicas
     if not username or len(username) < 3:
         return {"success": False, "error": "El nombre de usuario debe tener al menos 3 caracteres."}
@@ -146,13 +137,7 @@ def register_user(client: weaviate.Client, username: str, email: str, password: 
 
 
 def login_user(client: weaviate.Client, username: str, password: str) -> dict:
-    """
-    Autentica a un usuario y devuelve un JWT si las credenciales son correctas.
-
-    Devuelve:
-        {"success": True, "token": "...", "username": "...", "user_id": "..."}
-        {"success": False, "error": "mensaje de error"}
-    """
+    """ Autentica a un usuario y devuelve un JWT si las credenciales son correctas """
     if not username or not password:
         return {"success": False, "error": "Usuario y contraseña son requeridos."}
 
