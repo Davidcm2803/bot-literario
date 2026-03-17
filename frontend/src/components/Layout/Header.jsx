@@ -9,7 +9,7 @@ export const Header = ({ serverStatus }) => {
           <BookOpen className="w-5 h-5 text-primary" />
         </div>
         <div>
-          <h1 className="font-serif text-xl">Biblio IA</h1>
+          <h1 className="font-serif text-xl">Scriptia</h1>
           <p className="text-xs text-foreground/50">Tu bot literario inteligente</p>
         </div>
       </div>
