@@ -19,134 +19,119 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 MODEL_NAME = "llama-3.1-8b-instant"
 
-# Cantidad de mensajes de historial que se usan esto se va si no esta logueado
+# Cantidad de mensajes de historial que se usan
 MAX_HISTORY = 10
 
 
-# Construye el contexto a partir de los chunks de weavite
 def build_context(chunks):
-
     context_parts = []
 
-    for chunk in chunks:
-
-        # información del libro
+    for i, chunk in enumerate(chunks):
         book = chunk.get("book", [])
         book_info = book[0] if book else {}
 
         title = book_info.get("title", "Unknown")
         author = book_info.get("author", "Unknown")
 
-        content = chunk.get("content", "")[:500]
+        # Aumentado de 500 → 1200 chars para no perder eventos narrativos
+        content = chunk.get("content", "")[:1200]
 
         context_parts.append(
-            f"BOOK: {title}\n"
-            f"AUTHOR: {author}\n"
-            f"CONTENT: {content}\n"
+            f"[Fragment {i+1} — {title} by {author}]\n"
+            f"{content}\n"
         )
 
-    return "\n".join(context_parts)
+    return "\n---\n".join(context_parts)
 
 
-# Prompt que se crea para enviar al llm
 def build_prompt(context, question, history=None):
-
     history_text = ""
 
-    # agregar historial de conversación
     if history:
-
         history_text = "Conversation history:\n"
-
         for turn in history[-MAX_HISTORY:]:
-
             history_text += f"User: {turn['question']}\n"
             history_text += f"Assistant: {turn['answer']}\n"
-
         history_text += "\n"
 
     return f"""
-You are an intelligent literary assistant specialized in philosophy and literature.
+You are an expert literary assistant specializing in philosophy and literature,
+with deep knowledge of the works present in the provided context.
 
-Your task is to answer the user's question using ONLY the information contained in the context provided.
+Your job is to answer the user's question based on the fragments provided below.
+These fragments come directly from the books in the library.
 
-RULES:
+INSTRUCTIONS:
 
-1. The context is your ONLY source of factual information.
-2. If the answer cannot be found in the context, say clearly:
-   "No tengo suficiente información en los libros cargados para responder esa pregunta."
-3. Never invent information.
-4. Never guess authors, titles, dates, or facts.
-5. Never reveal or quote the context verbatim.
-6. Answer naturally and conversationally, like a knowledgeable human assistant.
-7. Keep the answer concise but informative.
-8. Always respond in the same language as the user's question.
+1. Read ALL fragments carefully before answering.
+2. The answer may be spread across multiple fragments — synthesize them.
+3. If a fact is clearly implied or described in the fragments, state it confidently.
+4. Do NOT be overly cautious — if the context supports the answer, give it.
+5. Only say you don't have information if the topic is genuinely absent from ALL fragments.
+6. Never invent facts, authors, dates, or plot points not present in the context.
+7. Never copy the fragments verbatim — paraphrase naturally.
+8. Answer in the same language as the user's question.
+9. Be concise but complete. Prefer 2–4 sentences unless more detail is needed.
 
 {history_text}
 
-Context:
+--- CONTEXT FRAGMENTS ---
 {context}
+--- END OF CONTEXT ---
 
-User Question:
-{question}
+User Question: {question}
 
-Assistant Answer:
-"""
+Assistant Answer:"""
 
 
-# Funcion principal de RAG
 def ask_rag_stream(question, history=None):
 
     print(f"\n{'='*50}")
     print(f"📥 Pregunta: {question}")
 
-    # Opcional mejorar búsqueda usando historial
+    # Construir query de búsqueda
     search_query = question
-
     if history:
         last_question = history[-1]["question"]
         search_query = f"{last_question} {question}"
 
-    # buscar chunks en Weaviate
+    # Boost para preguntas sobre personajes conocidos de Dune
+    keywords_boost = ["Paul", "Atreides", "Muad'Dib"] if any(
+        w in question.lower() for w in ["paul", "atreides", "muad"]
+    ) else []
+    if keywords_boost:
+        search_query = f"{search_query} {' '.join(keywords_boost)}"
+
+    # Buscar chunks en Weaviate
     chunks = search_chunks(search_query)
 
     print(f"🔍 Chunks encontrados: {len(chunks)}")
 
     if not chunks:
-
         print("⚠️ No se encontraron chunks relevantes")
         yield "No tengo información sobre eso en los libros cargados."
         return
 
-    # mostrar información de debug
+    # Debug de chunks
     for i, chunk in enumerate(chunks):
-
         book = chunk.get("book", [])
         book_info = book[0] if book else {}
-
         title = book_info.get("title", "?")
         author = book_info.get("author", "?")
         distance = chunk.get("_additional", {}).get("distance", "?")
-
         print(f"  Chunk {i+1}: {title} - {author} | dist: {distance}")
 
-    # construir contexto
+    # Construir contexto y prompt
     context = build_context(chunks)
-
-    # construir prompt
     prompt = build_prompt(context, question, history)
 
     print(f"📝 Prompt ({len(prompt)} chars) enviado a Groq")
 
-    # verificar API key
     if not GROQ_API_KEY:
-
         yield "Error: GROQ_API_KEY no está configurada."
         return
 
     try:
-
-        # enviar peticion al LLM
         response = requests.post(
             GROQ_URL,
             headers={
@@ -169,16 +154,13 @@ def ask_rag_stream(question, history=None):
         print(f"🤖 Groq status: {response.status_code}")
 
         if response.status_code != 200:
-
             print(f"❌ Error de Groq: {response.text}")
             yield "Error al conectar con el modelo."
             return
 
         token_count = 0
 
-        # Procesar streaming de tokens desde Groq
         for line in response.iter_lines():
-
             if not line:
                 continue
 
@@ -190,35 +172,27 @@ def ask_rag_stream(question, history=None):
             data_str = line[6:]
 
             if data_str == "[DONE]":
-
                 print(f"✅ Stream completo — {token_count} tokens generados")
                 break
 
             try:
-
                 data = json.loads(data_str)
-
                 token = data["choices"][0]["delta"].get("content", "")
-
                 if token:
-
                     token_count += 1
                     yield token
-
             except json.JSONDecodeError:
                 continue
 
     except requests.exceptions.Timeout:
-
         print("❌ Timeout conectando a Groq")
         yield "El modelo tardó demasiado en responder."
 
     except Exception as e:
-
         print(f"❌ Error inesperado: {e}")
         yield "Error inesperado al generar la respuesta."
 
 
-# Versión no streaming (devuelve texto completo)
 def ask_rag(question, history=None):
     return "".join(ask_rag_stream(question, history))
+```
