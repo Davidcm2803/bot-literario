@@ -19,7 +19,7 @@ MODEL_NAME   = "llama-3.3-70b-versatile"
 
 # Límites del sistema
 MAX_HISTORY       = 10
-MAX_CONTEXT_CHARS = 14000
+MAX_CONTEXT_CHARS = 18000
 
 
 # Convierte score BM25 (mayor=mejor) a "distancia" (menor=mejor)
