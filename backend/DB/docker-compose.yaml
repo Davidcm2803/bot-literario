@@ -20,7 +20,7 @@ services:
       - weaviate_data:/var/lib/weaviate  # Guarda los datos aunque apagues el contenedor
 
   t2v-transformers:
-    image: semitechnologies/transformers-inference:sentence-transformers-paraphrase-multilingual-MiniLM-L12-v2
+    image: semitechnologies/transformers-inference:sentence-transformers-all-mpnet-base-v2
     # Modelo que convierte texto en vectores (embeddings)
     environment:
       ENABLE_CUDA: "0"
