@@ -11,25 +11,23 @@ load_dotenv("key.env")
 
 from services.weaviate_service import search_chunks
 
-# URL y clave para la API de Groq
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# Modelo principal, bajar a llama-3.1-8b-instant si se necesita mas velocidad
 MODEL_NAME = "llama-3.3-70b-versatile"
 
-# Numero de turnos del historial que se incluyen en el prompt
+# Número de preguntas del historial que se incluyen en el prompt.
+# FIX: solo preguntas, NUNCA respuestas anteriores.
+# Las respuestas previas pueden estar mal y el LLM las toma como verdad.
 MAX_HISTORY = 6
 
 
 def build_context(chunks: list[dict]) -> str:
     """
-    Convierte la lista de chunks en texto legible agrupado por libro y ordenado por indice.
+    Convierte la lista de chunks en texto legible agrupado por libro y ordenado por índice.
     Soporta tanto BookChunk (chunk_index) como BookSummary (summary_index).
-    Los libros se muestran en el orden en que llegan los chunks (ya ordenados por score),
-    de modo que el libro mas relevante aparece primero en el contexto del LLM.
+    El libro más relevante (mayor score) aparece primero en el contexto del LLM.
     """
-    # Agrupa chunks por libro preservando el orden de llegada (score descendente)
     seen_books: list[str] = []
     groups: dict[str, list] = defaultdict(list)
     for chunk in chunks:
@@ -55,37 +53,45 @@ def build_context(chunks: list[dict]) -> str:
 
 def build_prompt(context: str, question: str, history=None) -> str:
     """
-    Construye el prompt completo con historial, contexto y pregunta del usuario.
+    Construye el prompt con contexto y pregunta.
 
-    Reglas del LLM:
-    1. Si los fragmentos contienen la respuesta directamente -> responder.
-    2. Si los fragmentos tienen contexto relacionado pero no la respuesta exacta
-       -> dar respuesta parcial e indicar en que libro podria estar la info faltante.
-    3. Solo decir que no hay info si los fragmentos son completamente irrelevantes.
+    FIX 1: El historial incluye SOLO las preguntas anteriores, nunca las respuestas.
+            Las respuestas previas son potencialmente incorrectas y contaminarían
+            la respuesta actual.
 
-    Esto evita el problema de responder "no tengo informacion" cuando el evento
-    ocurre en un libro de la saga diferente al que se estaba discutiendo.
+    FIX 2: Reglas del sistema más cortas y sin ambigüedad.
+            Se elimina el permiso implícito de especular ("may occur later")
+            que generaba respuestas largas e inventadas.
+
+    FIX 3: temperature=0 y max_tokens reducido se configuran en la llamada,
+            no aquí, pero el prompt refuerza la brevedad con "2-3 sentences".
     """
+    # FIX: solo preguntas del historial, sin respuestas
     history_text = ""
     if history:
-        history_text = "Recent conversation:\n"
-        for turn in history[-MAX_HISTORY:]:
-            history_text += f"User: {turn['question']}\nAssistant: {turn['answer']}\n"
-        history_text += "\n"
+        recent_questions = [
+            t.get("question", "").strip()
+            for t in history[-MAX_HISTORY:]
+            if t.get("question", "").strip()
+        ]
+        if recent_questions:
+            history_text = (
+                "Previous questions in this conversation (for context only):\n"
+                + "\n".join(f"- {q}" for q in recent_questions)
+                + "\n\n"
+            )
 
     return (
-        "You are a literary assistant. Answer the question using only the "
-        "book fragments below. Be concise (2-4 sentences). "
-        "Answer in the same language as the question.\n\n"
-        "Rules:\n"
-        "1. If the fragments contain the answer directly, answer it.\n"
-        "2. If the fragments contain related context but not a direct answer, "
-        "use that context to give a partial answer and clarify what is not covered. "
-        "For example: 'This event does not appear in the DUNE fragments provided; "
-        "it may occur in a later book in the saga such as Dune Messiah.'\n"
-        "3. Only say 'No tengo suficiente informacion en los libros cargados.' "
-        "if the fragments are completely unrelated to the question.\n"
-        "Never invent facts not present in the fragments.\n\n"
+        "You are a literary assistant. Answer questions using ONLY the book fragments below.\n\n"
+        "RULES:\n"
+        "1. Answer in the SAME language as the question.\n"
+        "2. Be direct and concise: 2-3 sentences maximum.\n"
+        "3. Base your answer ONLY on the fragments. Never invent or assume facts.\n"
+        "4. Read ALL fragments before answering — the answer may be near the end.\n"
+        "5. If a fragment explicitly describes an event (death, blinding, betrayal), "
+        "state it clearly. Do not say 'it is not mentioned' if it appears anywhere.\n"
+        "6. If the fragments do not contain the answer, say exactly: "
+        "'' — nothing more.\n\n"
         f"{history_text}"
         f"--- FRAGMENTS ---\n{context}\n--- END ---\n\n"
         f"Question: {question}\nAnswer:"
@@ -94,7 +100,7 @@ def build_prompt(context: str, question: str, history=None) -> str:
 
 def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
     """
-    Pipeline RAG completo que devuelve la respuesta del LLM token por token via streaming.
+    Pipeline RAG completo que devuelve la respuesta del LLM token a token via streaming.
     Si se pasan chunks prefetched los usa directamente para no hacer el retrieval dos veces.
     """
     print(f"\n{'='*50}")
@@ -131,8 +137,8 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
                 "model":       MODEL_NAME,
                 "messages":    [{"role": "user", "content": prompt}],
                 "stream":      True,
-                "max_tokens":  600,
-                "temperature": 0.2,
+                "max_tokens":  400,   # FIX: reducido de 700 → fuerza respuestas concisas
+                "temperature": 0,     # FIX: 0 en lugar de 0.15 → consistencia entre sesiones
             },
             stream=True,
             timeout=30,
@@ -176,5 +182,5 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
 
 
 def ask_rag(question: str, history=None) -> str:
-    """Version sincrona del pipeline, util para tests o el endpoint GET."""
+    """Versión síncrona del pipeline, útil para tests o el endpoint GET."""
     return "".join(ask_rag_stream(question, history))
