@@ -7,26 +7,20 @@ import requests
 from collections import defaultdict
 from dotenv import load_dotenv
 
-load_dotenv("key.env")
+load_dotenv(".env")
 
 from services.weaviate_service import search_chunks
 
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-
-MODEL_NAME = "llama-3.3-70b-versatile"
-
-# Número de preguntas del historial que se incluyen en el prompt.
-# FIX: solo preguntas, NUNCA respuestas anteriores.
-# Las respuestas previas pueden estar mal y el LLM las toma como verdad.
-MAX_HISTORY = 6
+MODEL_NAME   = "llama-3.3-70b-versatile"
+MAX_HISTORY  = 6
 
 
 def build_context(chunks: list[dict]) -> str:
     """
-    Convierte la lista de chunks en texto legible agrupado por libro y ordenado por índice.
-    Soporta tanto BookChunk (chunk_index) como BookSummary (summary_index).
-    El libro más relevante (mayor score) aparece primero en el contexto del LLM.
+    Agrupa chunks por libro ordenados por indice.
+    El libro con mayor score aparece primero en el contexto del LLM.
     """
     seen_books: list[str] = []
     groups: dict[str, list] = defaultdict(list)
@@ -39,12 +33,11 @@ def build_context(chunks: list[dict]) -> str:
     parts = []
     for bid in seen_books:
         book_chunks = groups[bid]
-        book_chunks.sort(key=lambda c: c.get("chunk_index",
-                                              c.get("summary_index", 0)))
+        book_chunks.sort(key=lambda c: c.get("chunk_index", c.get("summary_index", 0)))
         book_info = (book_chunks[0].get("book") or [{}])[0]
-        title     = book_info.get("title",  "Unknown")
-        author    = book_info.get("author", "Unknown")
-        combined  = "\n\n".join(c.get("content", "") for c in book_chunks)
+        title    = book_info.get("title",  "Unknown")
+        author   = book_info.get("author", "Unknown")
+        combined = "\n\n".join(c.get("content", "") for c in book_chunks)
         print(f"  {title} con {len(book_chunks)} chunks")
         parts.append(f"BOOK: {title}\nAUTHOR: {author}\n\n{combined}")
 
@@ -53,20 +46,10 @@ def build_context(chunks: list[dict]) -> str:
 
 def build_prompt(context: str, question: str, history=None) -> str:
     """
-    Construye el prompt con contexto y pregunta.
-
-    FIX 1: El historial incluye SOLO las preguntas anteriores, nunca las respuestas.
-            Las respuestas previas son potencialmente incorrectas y contaminarían
-            la respuesta actual.
-
-    FIX 2: Reglas del sistema más cortas y sin ambigüedad.
-            Se elimina el permiso implícito de especular ("may occur later")
-            que generaba respuestas largas e inventadas.
-
-    FIX 3: temperature=0 y max_tokens reducido se configuran en la llamada,
-            no aquí, pero el prompt refuerza la brevedad con "2-3 sentences".
+    Construye el prompt para el LLM.
+    Solo incluye preguntas del historial, nunca respuestas anteriores,
+    porque las respuestas previas pueden estar mal y el LLM las toma como verdad.
     """
-    # FIX: solo preguntas del historial, sin respuestas
     history_text = ""
     if history:
         recent_questions = [
@@ -87,11 +70,11 @@ def build_prompt(context: str, question: str, history=None) -> str:
         "1. Answer in the SAME language as the question.\n"
         "2. Be direct and concise: 2-3 sentences maximum.\n"
         "3. Base your answer ONLY on the fragments. Never invent or assume facts.\n"
-        "4. Read ALL fragments before answering — the answer may be near the end.\n"
+        "4. Read ALL fragments before answering, the answer may be near the end.\n"
         "5. If a fragment explicitly describes an event (death, blinding, betrayal), "
-        "state it clearly. Do not say 'it is not mentioned' if it appears anywhere.\n"
+        "state it clearly. Do not say it is not mentioned if it appears anywhere.\n"
         "6. If the fragments do not contain the answer, say exactly: "
-        "'' — nothing more.\n\n"
+        "'The fragments provided do not cover this.' and nothing more.\n\n"
         f"{history_text}"
         f"--- FRAGMENTS ---\n{context}\n--- END ---\n\n"
         f"Question: {question}\nAnswer:"
@@ -100,8 +83,8 @@ def build_prompt(context: str, question: str, history=None) -> str:
 
 def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
     """
-    Pipeline RAG completo que devuelve la respuesta del LLM token a token via streaming.
-    Si se pasan chunks prefetched los usa directamente para no hacer el retrieval dos veces.
+    Pipeline RAG completo con streaming token a token.
+    Acepta chunks prefetched para no repetir el retrieval si ya se hizo antes.
     """
     print(f"\n{'='*50}")
     print(f"Pregunta: {question}")
@@ -109,11 +92,11 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
     chunks = prefetched_chunks if prefetched_chunks is not None else search_chunks(question, history=history)
 
     if chunks and chunks[0].get("__ask_user__"):
-        yield "No estoy seguro sobre qué libro me preguntas. ¿Podrías mencionarlo?"
+        yield "No estoy seguro sobre que libro me preguntas. Podrias mencionarlo?"
         return
 
     if not chunks:
-        yield "No tengo información sobre eso en los libros cargados."
+        yield "No tengo informacion sobre eso en los libros cargados."
         return
 
     print(f"Chunks recuperados: {len(chunks)}")
@@ -123,7 +106,7 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
     print(f"Prompt: {len(prompt)} chars usando {MODEL_NAME}")
 
     if not GROQ_API_KEY:
-        yield "Error: GROQ_API_KEY no está configurada."
+        yield "Error: GROQ_API_KEY no esta configurada."
         return
 
     try:
@@ -137,8 +120,8 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
                 "model":       MODEL_NAME,
                 "messages":    [{"role": "user", "content": prompt}],
                 "stream":      True,
-                "max_tokens":  400,   # FIX: reducido de 700 → fuerza respuestas concisas
-                "temperature": 0,     # FIX: 0 en lugar de 0.15 → consistencia entre sesiones
+                "max_tokens":  400,
+                "temperature": 0,
             },
             stream=True,
             timeout=30,
@@ -147,7 +130,7 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
         print(f"Groq status: {response.status_code}")
 
         if response.status_code == 429:
-            yield "El servicio está ocupado, intenta de nuevo en un momento."
+            yield "El servicio esta ocupado, intenta de nuevo en un momento."
             return
 
         if response.status_code != 200:
@@ -175,12 +158,12 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
                 continue
 
     except requests.exceptions.Timeout:
-        yield "El modelo tardó demasiado en responder."
+        yield "El modelo tardo demasiado en responder."
     except Exception as e:
         print(f"Error: {e}")
         yield "Error inesperado."
 
 
 def ask_rag(question: str, history=None) -> str:
-    """Versión síncrona del pipeline, útil para tests o el endpoint GET."""
+    """Version sincrona del pipeline, util para tests o el endpoint GET."""
     return "".join(ask_rag_stream(question, history))
