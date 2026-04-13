@@ -1,29 +1,39 @@
+version: "3.9"
 services:
-
+  # Instancia principal de Weaviate como base de datos vectorial
   weaviate:
-    image: semitechnologies/weaviate:latest  # Imagen oficial de Weaviate
-    container_name: weaviate               # Nombre del contenedor
-    restart: unless-stopped                # Se reinicia automáticamente si se cae
-
+    image: semitechnologies/weaviate:latest
+    container_name: weaviate
+    # Reinicia automaticamente salvo que se detenga de forma manual
+    restart: unless-stopped
     ports:
-      - "8080:8080"  # Expone el puerto 8080 (API de Weaviate) ESTO ES INDEPENDIENTE DE EL PUERTO PEDIDO PARA FLASK
-
+      - "8080:8080"
     environment:
-      QUERY_DEFAULTS_LIMIT: 25  # Máximo de resultados por búsqueda si no se especifica límite
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"  # Permite acceso sin login (solo desarrollo)
-      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"  # Ruta donde se guardan los datos
-      DEFAULT_VECTORIZER_MODULE: "text2vec-transformers"  # Módulo que convierte texto en vectores
-      ENABLE_MODULES: "text2vec-transformers"  # Activa el módulo de embeddings
-      TRANSFORMERS_INFERENCE_API: "http://t2v-transformers:8080"  # Conecta con el contenedor que genera los embeddings
-
+      # Limite por defecto de resultados en consultas
+      QUERY_DEFAULTS_LIMIT: 25
+      # Permite acceso sin autenticacion para desarrollo local
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      # Ruta donde Weaviate guarda los datos en disco
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      # Modulo vectorizador que se usa por defecto al crear clases
+      DEFAULT_VECTORIZER_MODULE: "text2vec-transformers"
+      # Lista de modulos activos en esta instancia
+      ENABLE_MODULES: "text2vec-transformers"
+      # URL del servicio de inferencia donde se ejecuta el modelo de embeddings
+      TRANSFORMERS_INFERENCE_API: "http://t2v-transformers:8080"
     volumes:
-      - weaviate_data:/var/lib/weaviate  # Guarda los datos aunque apagues el contenedor
+      # Volumen persistente para que los datos sobrevivan reinicios del contenedor
+      - weaviate_data:/var/lib/weaviate
 
+  # Servicio de inferencia que corre el modelo snowflake arctic-embed-l-v2.0
+  # Genera los vectores de 1024 dimensiones con ventana de 8192 tokens
+  # Se usa sin GPU ya que ENABLE_CUDA esta en 0
   t2v-transformers:
-    image: semitechnologies/transformers-inference:sentence-transformers-all-mpnet-base-v2
-    # Modelo que convierte texto en vectores (embeddings)
+    image: cr.weaviate.io/semitechnologies/transformers-inference:Snowflake-snowflake-arctic-embed-l-v2.0
     environment:
+      # Desactiva el uso de GPU y corre la inferencia solo en CPU
       ENABLE_CUDA: "0"
 
 volumes:
-  weaviate_data:  # Volumen persistente para guardar la base de datos
+  # Declara el volumen compartido para persistencia de datos de Weaviate
+  weaviate_data:

@@ -48,19 +48,19 @@
 
 @layer base {
   :root {
-    --background: 210 40% 98%;
-    --foreground: 222 47% 11%;
-    --card: 0 0% 100%;
-    --primary: 168 76% 42%;
-    --primary-foreground: 210 40% 98%;
-    --border: 214 32% 91%;
-  }
+  --background: 45 40% 96%;
+  --foreground: 20 40% 10%;
+  --card: 45 40% 99%;
+  --primary: 168 76% 35%;         
+  --primary-foreground: 45 40% 96%;
+  --border: 40 30% 85%;
+}
 
   .dark {
     --background: 222 47% 4%;
     --foreground: 213 31% 91%;
     --card: 222 47% 8%;
-    --primary: 168 76% 42%;
+    --primary: 168 76% 32%;
     --primary-foreground: 213 31% 91%;
     --border: 214 33% 20%;
   }
