@@ -1,3 +1,5 @@
+#rag_service.py
+
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,15 +21,18 @@ MAX_HISTORY  = 6
 
 def build_context(chunks: list[dict]) -> str:
     """
-    Agrupa chunks por libro ordenados por indice.
-    El libro con mayor score aparece primero en el contexto del LLM.
+    Agrupa chunks por libro ordenados por chunk_index.
+    El orden entre libros respeta el ranking del retrieval:
+    el libro cuyo primer chunk aparece más arriba en la lista va primero.
+    Así, si DUNE MESSIAH tiene el chunk más relevante, aparece primero en el contexto.
     """
+    # Determinar el orden de los libros según su primer chunk en el ranking
     seen_books: list[str] = []
     groups: dict[str, list] = defaultdict(list)
     for chunk in chunks:
         bid = chunk.get("book_id", "unknown")
         if bid not in groups:
-            seen_books.append(bid)
+            seen_books.append(bid)  # primer chunk de este libro en el ranking
         groups[bid].append(chunk)
 
     parts = []
@@ -65,14 +70,16 @@ def build_prompt(context: str, question: str, history=None) -> str:
             )
 
     return (
-        "You are a literary assistant. Answer questions using ONLY the book fragments below.\n\n"
+        "You are a literary assistant. Answer questions using ONLY the book fragments below.\n"
+        "The fragments may come from multiple books in the same series — use all of them.\n\n"
         "RULES:\n"
         "1. Answer in the SAME language as the question.\n"
         "2. Be direct and concise: 2-3 sentences maximum.\n"
         "3. Base your answer ONLY on the fragments. Never invent or assume facts.\n"
-        "4. Read ALL fragments before answering, the answer may be near the end.\n"
+        "4. Read ALL fragments before answering, the answer may be in any of the books.\n"
         "5. If a fragment explicitly describes an event (death, blinding, betrayal), "
-        "state it clearly. Do not say it is not mentioned if it appears anywhere.\n"
+        "state it clearly and mention which book it is from. "
+        "Do not say it is not mentioned if it appears anywhere in the fragments.\n"
         "6. If the fragments do not contain the answer, say exactly: "
         "'The fragments provided do not cover this.' and nothing more.\n\n"
         f"{history_text}"

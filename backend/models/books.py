@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import requests
+import unicodedata
 import weaviate
 from dotenv import load_dotenv
 load_dotenv("key.env")
@@ -21,13 +22,91 @@ GROQ_URL      = "https://api.groq.com/openai/v1/chat/completions"
 SUMMARY_MODEL = "llama-3.1-8b-instant"
 
 
+# Tabla de transliteración: caracteres Unicode frecuentes → ASCII equivalente.
+# Evita que _clean_text los elimine silenciosamente fusionando palabras.
+_UNICODE_TO_ASCII = str.maketrans({
+    # Comillas tipográficas
+    "\u2018": "'",  # '
+    "\u2019": "'",  # '
+    "\u201C": '"',  # "
+    "\u201D": '"',  # "
+    "\u201E": '"',  # „
+    "\u201F": '"',  # ‟
+    "\u2039": "'",  # ‹
+    "\u203A": "'",  # ›
+    "\u00AB": '"',  # «
+    "\u00BB": '"',  # »
+    # Guiones
+    "\u2013": "-",  # – (en dash)
+    "\u2014": "-",  # — (em dash)
+    "\u2015": "-",  # ― (horizontal bar)
+    "\u2012": "-",  # ‒ (figure dash)
+    # Puntos y elipsis
+    "\u2026": "...",  # …
+    "\u00B7": ".",    # · (middle dot)
+    # Espacios especiales → espacio normal
+    "\u00A0": " ",  # non-breaking space
+    "\u202F": " ",  # narrow no-break space
+    "\u2009": " ",  # thin space
+    "\u2003": " ",  # em space
+    "\u2002": " ",  # en space
+    # Otros frecuentes en libros escaneados
+    "\u00AE": "(R)",
+    "\u00A9": "(C)",
+    "\u2122": "(TM)",
+    "\u00B0": " degrees",
+    "\u00D7": "x",  # ×
+    "\u00F7": "/",  # ÷
+    "\u2019": "'",  # right single quotation (duplicado por seguridad)
+})
+
+
+def _sanitize_text(text: str) -> str:
+    """
+    Convierte caracteres Unicode problemáticos a ASCII equivalente
+    antes de aplicar cualquier otro filtro.
+    Usa tres pasos:
+      1. Tabla explícita de los más frecuentes en libros.
+      2. Descomposición NFD para letras acentuadas (é → e + ́).
+      3. Eliminación de lo que quede fuera de Latin Extended.
+    Así nunca se fusionan palabras por eliminación silenciosa.
+    """
+    # Paso 1: transliteración explícita
+    text = text.translate(_UNICODE_TO_ASCII)
+
+    # Paso 2: NFD → quita diacríticos sueltos pero preserva la letra base
+    # Solo aplica a caracteres fuera del rango ASCII básico
+    result = []
+    for ch in text:
+        cp = ord(ch)
+        if cp <= 0x7E:
+            result.append(ch)
+            continue
+        # Intenta descomponer y quedarse solo con la base ASCII
+        normalized = unicodedata.normalize("NFD", ch)
+        ascii_base = "".join(
+            c for c in normalized if unicodedata.category(c) != "Mn" and ord(c) <= 0x7E
+        )
+        if ascii_base:
+            result.append(ascii_base)
+        elif 0xA0 <= cp <= 0xFF or 0x0100 <= cp <= 0x024F:
+            # Latin Extended: conservar tal cual (Weaviate lo maneja)
+            result.append(ch)
+        else:
+            # Reemplazar con espacio en lugar de eliminar
+            # para no fusionar palabras adyacentes
+            result.append(" ")
+
+    return "".join(result)
+
+
 # Limpia el texto crudo del archivo y extrae metadatos como titulo, autor, idioma y año
 def _clean_text(raw: str) -> tuple[str, dict]:
     metadata = {"title": "Desconocido", "author": "Desconocido",
                 "language": "Desconocido", "year": 0}
 
-    # Elimina caracteres que no son imprimibles ni latin extendido
-    raw = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\xA0-\xFF\u0100-\u024F]', '', raw)
+    # Primero sanitizar Unicode para no perder palabras en los pasos siguientes
+    raw = _sanitize_text(raw)
 
     # Busca campos de metadatos en el encabezado del archivo
     for pattern, key in [
@@ -51,7 +130,7 @@ def _clean_text(raw: str) -> tuple[str, dict]:
     if metadata["author"] == "Desconocido" and len(lines) > 1:
         metadata["author"] = lines[1]
 
-    # Recorta el texto para quedarse solo con el contenido del libro, sin el encabezado de Gutenberg
+    # Recorta el texto para quedarse solo con el contenido del libro
     text = raw
     for marker in [r"\*\*\* START OF (THE|THIS) PROJECT GUTENBERG",
                    r"\*\*\* BEGIN OF (THE|THIS) PROJECT GUTENBERG"]:
@@ -111,16 +190,14 @@ def _split_into_summary_blocks(text: str) -> list[tuple[str, str]]:
     return blocks
 
 
-# Llama a la API de Groq para resumir un bloque de texto del libro con enfoque en hechos y personajes
+# Llama a la API de Groq para resumir un bloque de texto del libro
 def _summarize_block(raw_text: str, title: str, author: str) -> str:
     groq_api_key = os.environ.get("GROQ_API_KEY")
 
-    # Si no hay clave de API usa las primeras 250 palabras como fallback
     if not groq_api_key:
         print("  GROQ_API_KEY no configurada, usando fallback de 250 palabras")
         return " ".join(raw_text.split()[:250])
 
-    # Limita el texto enviado a la API a las primeras 5000 palabras
     excerpt = " ".join(raw_text.split()[:5000])
 
     try:
@@ -167,7 +244,7 @@ def _summarize_block(raw_text: str, title: str, author: str) -> str:
         return " ".join(raw_text.split()[:250])
 
 
-# Genera un resumen general del libro enfocado en temas principales, personajes y premisa central
+# Genera un resumen general del libro enfocado en temas principales, personajes etc
 def _summarize_overview(raw_text: str, title: str, author: str) -> str:
     groq_api_key = os.environ.get("GROQ_API_KEY")
     if not groq_api_key:
@@ -236,12 +313,10 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
     title  = meta["title"]
     author = meta["author"]
 
-    # Si el libro ya esta en la base de datos no lo vuelve a subir
     if book_exists(client, title, author):
         return {"status": "skipped", "title": title,
                 "reason": "Ya existe en la base de datos"}
 
-    # Crea el objeto principal del libro en Weaviate
     book_id = str(uuid.uuid4())
     client.data_object.create(
         data_object={"title": title, "author": author,
@@ -250,7 +325,6 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
         uuid=book_id,
     )
 
-    # Divide el texto en chunks y los sube uno por uno con referencia al libro
     chunks = _split_into_chunks(text)
     print(f"    BookChunks: {len(chunks)}")
 
@@ -269,7 +343,6 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
         if idx % 50 == 0:
             print(f"    chunk {idx}/{len(chunks)}...")
 
-    # Divide el texto en bloques grandes, resume cada uno y lo guarda como BookSummary
     blocks = _split_into_summary_blocks(text)
     print(f"    Bloques para summary: {len(blocks)}")
 
@@ -294,7 +367,6 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
             to_class_name="Book",         to_uuid=book_id,
         )
 
-    # Genera y guarda un resumen general del libro con indice especial -1
     print(f"    Generando overview summary...")
     overview_text    = " ".join(text.split()[:8000])
     overview_summary = _summarize_overview(overview_text, title, author)
@@ -355,7 +427,7 @@ def upload_all_books(client: weaviate.Client,
     return results
 
 
-# Genera overviews para libros ya cargados en la base de datos que no tengan uno todavia
+# Genera overviews para libros ya cargados que no tengan uno todavia
 def generate_missing_overviews(client: weaviate.Client) -> list[dict]:
     books = list_books(client)
     results = []
@@ -368,7 +440,6 @@ def generate_missing_overviews(client: weaviate.Client) -> list[dict]:
         if not book_id:
             continue
 
-        # Verifica si el libro ya tiene un overview guardado
         existing = search_summaries_hybrid(
             client, "overview themes plot",
             limit=1, book_id=book_id, position="overview", alpha=0.75
@@ -380,7 +451,6 @@ def generate_missing_overviews(client: weaviate.Client) -> list[dict]:
 
         print(f"  Generando overview para '{title}'...")
 
-        # Obtiene los primeros chunks del libro por indice para construir el texto base
         first_chunks = []
         for idx in range(20):
             chunk = get_chunk_by_book_and_index(client, book_id, idx)
@@ -397,7 +467,6 @@ def generate_missing_overviews(client: weaviate.Client) -> list[dict]:
 
         overview_summary = _summarize_overview(overview_text, title, author)
 
-        # Guarda el overview como BookSummary con indice -1 y posicion overview
         sid = str(uuid.uuid4())
         client.data_object.create(
             data_object={
@@ -434,7 +503,6 @@ def search_chunks_hybrid(client: weaviate.Client,
         .with_limit(limit)
         .with_additional(["score", "id"])
     )
-    # Si se pasa un book_id filtra los resultados para ese libro solamente
     if book_id:
         q = q.with_where({
             "path": ["book_id"], "operator": "Equal", "valueText": book_id
@@ -449,7 +517,6 @@ def search_summaries_hybrid(client: weaviate.Client,
                             book_id: str | None = None,
                             position: str | None = None,
                             alpha: float = 0.75) -> list[dict]:
-    # Construye los filtros segun los parametros que vengan definidos
     filters = []
     if book_id:
         filters.append({"path": ["book_id"], "operator": "Equal", "valueText": book_id})
@@ -476,7 +543,7 @@ def search_summaries_hybrid(client: weaviate.Client,
     return q.do().get("data", {}).get("Get", {}).get("BookSummary", [])
 
 
-# Busca chunks usando solo el componente vectorial de la busqueda hibrida
+# Busca chunks usando solo el componente vectorial
 def search_books(client: weaviate.Client, query: str,
                  limit: int = 10, book_id: str | None = None) -> list[dict]:
     return search_chunks_hybrid(client, query, limit=limit,
@@ -521,7 +588,6 @@ def get_chunk_by_book_and_index(client: weaviate.Client,
 def expand_chunks_with_neighbors(client: weaviate.Client,
                                  chunks: list[dict],
                                  window: int = 1) -> list[dict]:
-    # Registra los chunks originales por clave de libro e indice
     seen: dict[tuple, dict] = {}
 
     for chunk in chunks:
@@ -530,7 +596,6 @@ def expand_chunks_with_neighbors(client: weaviate.Client,
         if bid and idx is not None:
             seen[(bid, idx)] = chunk
 
-    # Para cada chunk busca sus vecinos dentro del rango de la ventana
     for chunk in list(chunks):
         bid = chunk.get("book_id")
         idx = chunk.get("chunk_index")
@@ -550,12 +615,11 @@ def expand_chunks_with_neighbors(client: weaviate.Client,
             if neighbor:
                 seen[key] = neighbor
 
-    # Devuelve todos los chunks ordenados por libro e indice
     return sorted(seen.values(),
                   key=lambda c: (c.get("book_id", ""), c.get("chunk_index", 0)))
 
 
-# Devuelve la lista de todos los libros guardados en Weaviate con sus metadatos
+# Devuelve la lista de todos los libros guardados en Weaviate
 def list_books(client: weaviate.Client) -> list[dict]:
     result = (
         client.query.get("Book", ["title", "author", "year", "language"])
@@ -568,7 +632,6 @@ def list_books(client: weaviate.Client) -> list[dict]:
 
 # Elimina un libro completo de Weaviate incluyendo todos sus chunks y resumenes
 def delete_book(client: weaviate.Client, book_id: str) -> bool:
-    # Borra primero todos los objetos relacionados en BookChunk y BookSummary
     for class_name, index_field in [("BookChunk", "chunk_index"),
                                      ("BookSummary", "summary_index")]:
         r = (
@@ -581,6 +644,5 @@ def delete_book(client: weaviate.Client, book_id: str) -> bool:
         for obj in r.get("data", {}).get("Get", {}).get(class_name, []):
             client.data_object.delete(obj["_additional"]["id"], class_name=class_name)
 
-    # Borra el objeto principal del libro
     client.data_object.delete(book_id, class_name="Book")
     return True
