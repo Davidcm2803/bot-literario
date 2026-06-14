@@ -1,140 +1,270 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import re
-import json
-import requests
-import unicodedata
+import os, re, json, unicodedata, requests
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import current_app
 from dotenv import load_dotenv
-
 from models.books import (
-    search_chunks_hybrid,
-    search_summaries_hybrid,
-    expand_chunks_with_neighbors,
-    list_books,
+    search_chunks_hybrid, search_summaries_hybrid,
+    expand_chunks_with_neighbors, list_books,
 )
 
-load_dotenv(".env")
-
-MAX_CHUNKS_TO_LLM    = 10
-MAX_CONTEXT_CHARS    = 20_000
-MIN_CHUNKS_THRESHOLD = 4
-MIN_RELEVANCE_SCORE  = 0.55
-
-LIMIT_VECTOR         = 5
-LIMIT_BM25           = 4
-BM25_SKIP_THRESHOLD  = 0.75
-
-TOP_N_EXPAND_GLOBAL  = 7
-TOP_N_EXPAND_DIRECT  = 5
+load_dotenv("key.env")
 
 GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL   = "llama-3.3-70b-versatile"
 
-# Detecta si la query ya esta en ingles para saltar la traduccion
-_EN_PATTERN = re.compile(
-    r'\b(what|who|how|when|where|does|did|is|are|the|of|in|to|and|his|her)\b',
+MAX_CHUNKS_LLM    = 8
+MAX_CONTEXT_CHARS = 18_000
+SEARCH_LIMIT      = 10
+NEIGHBOR_SCORE    = 0.85
+NEIGHBOR_TOP_N    = 3
+MIN_SCORE         = 0.25
+FOREIGN_CAP       = 2
+
+
+def _normalize(text):
+    """
+    Toma cualquier texto y lo estandariza: lo pasa a minúsculas, 
+    le quita las tildes y elimina los signos de puntuación. 
+    Esto es súper útil para comparar palabras sin que una tilde o una coma arruinen el match.
+    """
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return re.sub(r"[^\w\s]", " ", text)
+
+def _score(chunk):
+    """
+    Extrae de forma segura la puntuación (score) que Weaviate le dio a un fragmento de texto.
+    Si el fragmento no tiene puntuación o hay algún error, devuelve 0.0 por defecto.
+    """
+    try:
+        return float(chunk.get("_additional", {}).get("score", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _chunk_id(chunk):
+    """
+    Saca el ID único de un fragmento desde sus metadatos ocultos (_additional).
+    """
+    return chunk.get("_additional", {}).get("id", "")
+
+def _book_id(chunk):
+    """
+    Saca el ID del libro al que pertenece este fragmento de texto.
+    """
+    return chunk.get("book_id", "")
+
+def _merge(base, extra):
+    """
+    Une dos listas de fragmentos de texto (chunks) asegurándose de no meter duplicados.
+    Revisa los IDs de la lista base y solo agrega los de la lista extra que sean nuevos.
+    """
+    seen = {_chunk_id(c) for c in base}
+    return base + [c for c in extra if _chunk_id(c) not in seen]
+
+def _limit(chunks):
+    """
+    Recorta la lista de fragmentos para no saturar al LLM. 
+    Se detiene cuando llega al límite máximo de fragmentos permitidos o 
+    cuando la cantidad total de caracteres supera el límite de contexto.
+    """
+    result, total = [], 0
+    for c in chunks:
+        n = len(c.get("content", ""))
+        if len(result) >= MAX_CHUNKS_LLM or total + n > MAX_CONTEXT_CHARS:
+            break
+        result.append(c)
+        total += n
+    print(f"  -> {len(result)} chunks al LLM ({total} chars)")
+    return result
+
+
+_JUNK_HEADERS = re.compile(
+    r'\b(glossary|glosario|appendix|ap[eé]ndice|bibliography|'
+    r'index|[íi]ndice|copyright|all\s+rights\s+reserved|'
+    r'publishing\s+group|printed\s+in)\b',
+    re.IGNORECASE,
+)
+_GLOSSARY_LINE = re.compile(r'^[A-Z\s\'\-]{3,40}:\s', re.MULTILINE)
+
+def _is_junk(chunk):
+    """
+    Evalúa si un fragmento de texto es 'basura' para el contexto del LLM.
+    Descarta cosas como el glosario, el índice, la página de copyright 
+    o listas de capítulos que no aportan valor narrativo para responder preguntas.
+    """
+    if chunk.get("chunk_index", 1) == 0:
+        return True
+    content = chunk.get("content", "")
+    if _JUNK_HEADERS.search(content[:300]):
+        return True
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    if not lines:
+        return False
+    glossary = sum(1 for l in lines if _GLOSSARY_LINE.match(l)) / len(lines)
+    chapters = sum(1 for l in lines if re.match(r"^Chapter\s+\d+", l, re.I)) / len(lines)
+    return glossary > 0.5 or chapters > 0.5
+
+
+_translation_cache: dict = {}
+_IS_ENGLISH = re.compile(
+    r'\b(what|who|how|when|where|does|did|is|are|the|of|in|and|his|her)\b',
     re.IGNORECASE,
 )
 
-_SEQUEL_PATTERNS = re.compile(
-    r'\b(siguiente|secuela|continuaci[oó]n|pr[oó]ximo|despu[eé]s|next|sequel|after)\b',
-    re.IGNORECASE
-)
+def _groq(messages, max_tokens=120, temperature=0.0):
+    """
+    Se encarga de hacer la llamada HTTP a la API de Groq con los mensajes proporcionados.
+    Maneja el timeout y devuelve el texto de la respuesta, o None si algo falla.
+    """
+    if not GROQ_API_KEY:
+        return None
+    try:
+        r = requests.post(
+            GROQ_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": GROQ_MODEL, "messages": messages,
+                  "max_tokens": max_tokens, "temperature": temperature},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        print(f"  Groq {r.status_code}")
+    except Exception as e:
+        print(f"  Groq error: {e}")
+    return None
 
-_SUMMARY_PATTERNS = re.compile(
-    r'\b('
-    r'qu[eé]\s+(pas[oó]|ocurri[oó]|le\s+pas[oó]|sucedi[oó]|hace|hizo)|'
-    r'(trata|habla|cuenta)\s+(el|la|los)?\s*(libro|historia|novela)?|'
-    r'resumen|resume|summarize|summary|synopsis|sinopsis|'
-    r'al\s+final|how\s+does\s+.*\s+end|c[oó]mo\s+termina|'
-    r'qu[eé]\s+le\s+pasa\s+a|what\s+happens\s+to|'
-    r'qui[eé]n\s+es|who\s+is|who\s+are|'
-    r'de\s+qu[eé]\s+(trata|va)|what\s+is\s+.*\s+about|'
-    r'cu[aá]l\s+es\s+(la\s+)?trama|what\s+is\s+the\s+plot|'
-    r'cu[eé]ntame|tell\s+me\s+about|'
-    r'qu[eé]\s+rol|what\s+role|'
-    r'termina|ends?|outcome|desenlace|'
-    r'tema\s+principal|main\s+theme|temas?|themes?'
-    r')\b',
-    re.IGNORECASE
-)
+def _to_english(query):
+    """
+    Traduce de manera rápida la pregunta del usuario al inglés usando Groq.
+    Si detecta que ya está en inglés, se salta la traducción. 
+    Además guarda un caché de traducciones para no repetir la misma petición.
+    """
+    if _IS_ENGLISH.search(query):
+        return query
+    if query in _translation_cache:
+        return _translation_cache[query]
+    result = _groq([
+        {"role": "system", "content":
+            "Translate the user's short Spanish search query to English. "
+            "Reply ONLY with the translation, nothing else."},
+        {"role": "user", "content": query},
+    ], max_tokens=60)
+    translated = result if (result and result.lower() != query.lower()) else query
+    _translation_cache[query] = translated
+    if translated != query:
+        print(f"  Traduccion: '{query}' -> '{translated}'")
+    return translated
 
-_SPECIFIC_PATTERNS = re.compile(
-    r'\b('
-    r'cu[aá]ndo|when\s+exactly|d[oó]nde\s+exactamente|'
-    r'c[oó]mo\s+funciona|how\s+does\s+.*\s+work|'
-    r'exact(amente|ly)|textualmente|literally|'
-    r'cu[aá]l\s+es\s+la\s+frase|what\s+did\s+.*\s+say|'
-    r'describe\s+exactamente|explica\s+en\s+detalle|'
-    r'qu[eé]\s+es\s+(el|la|un|una)|what\s+is\s+(the\s+)?\w+\s*\?|'
-    r'cieg[oa]|blind|pierde\s+la\s+vista|loses?\s+(his|her)?\s+sight|'
-    r'muer[et][eo]|murio|muere|muerte|dies?|killed|assassinat|'
-    r'herido|wounded|injur|'
-    r'traicion|betray|'
-    r'cas[ao]|marr(ies?|iage)|'
-    r'nac[eió]|born|gives?\s+birth'
-    r')\b',
-    re.IGNORECASE
-)
+def _enrich_query(query, history, all_books=None):
+    """
+    Reescribe la pregunta del usuario dándole contexto basado en el historial.
+    Por ejemplo, si el usuario dice "qué le pasó a él", y antes hablaban de Paul,
+    lo cambia a "qué le pasó a Paul". Tiene un seguro integrado: si la reescritura 
+    accidentalmente borra el título de un libro que sí estaba en la pregunta original, 
+    se descarta la reescritura para no arruinar la búsqueda.
+    """
+    if not history:
+        return query
+    context = "\n".join(
+        f"Q: {t['question']}"
+        for t in history[-4:] if t.get("question", "").strip()
+    )
+    if not context:
+        return query
+    result = _groq([
+        {"role": "system", "content":
+            "You are a query rewriter for a book Q&A system.\n"
+            "Rewrite the follow-up question to be self-contained by replacing pronouns "
+            "(he, she, it, they, el, ella, su, sus) with the actual character/book names "
+            "from the previous questions.\n"
+            "Rules:\n"
+            "- Only use names/facts from the previous QUESTIONS, never from answers.\n"
+            "- NEVER remove or replace book titles already present in the follow-up.\n"
+            "- Do NOT add new book titles that are not already in the follow-up.\n"
+            "- Keep it short (max 12 words).\n"
+            "- Reply ONLY with the rewritten query, nothing else."},
+        {"role": "user", "content":
+            f"Previous questions:\n{context}\n\nFollow-up: {query}"},
+    ], max_tokens=60)
+    if result and result.strip() and result.lower() != query.lower():
+        result = re.sub(r'^[¡¿"\']+|[!"\']+$', '', result).strip()
 
-_POSITION_PATTERNS = {
-    "beginning": re.compile(
-        r'\b(al\s+inicio|al\s+principio|al\s+comienzo|'
-        r'at\s+the\s+(beginning|start)|how\s+(does|did)\s+.*\s+(start|begin)|'
-        r'primera\s+parte|first\s+part)\b',
-        re.IGNORECASE
-    ),
-    "end": re.compile(
-        r'\b(al\s+final|al\s+t[eé]rmino|at\s+the\s+end|'
-        r'how\s+does\s+.*\s+end|c[oó]mo\s+termina|'
-        r'desenlace|ending|[uú]ltima\s+parte|last\s+part|'
-        r'muer[et][eo]|murio|muere|muerte|dies?|killed|'
-        r'sobrevive|survive[sd]?|c[oó]mo\s+acaba|'
-        r'destino\s+de|fate\s+of)\b',
-        re.IGNORECASE
-    ),
-}
+        # Validación: si la query original tenía un libro conocido y
+        # la enriquecida lo perdió, descartar el enriquecimiento.
+        if all_books:
+            books_in_original  = _detect_books(query, all_books)
+            books_in_enriched  = _detect_books(result, all_books)
+            orig_ids = {b.get("_additional", {}).get("id") for b in books_in_original}
+            enr_ids  = {b.get("_additional", {}).get("id") for b in books_in_enriched}
+            lost = orig_ids - enr_ids
+            if lost:
+                lost_titles = [
+                    b.get("title", "?") for b in books_in_original
+                    if b.get("_additional", {}).get("id") in lost
+                ]
+                print(f"  Enriquecimiento descartado: perdía libro(s) {lost_titles}")
+                return query
 
-_OVERVIEW_PATTERNS = re.compile(
-    r'\b('
-    r'tema\s+principal|main\s+theme|temas?|themes?|'
-    r'de\s+qu[eé]\s+(trata|va)|what\s+is\s+.*\s+about|'
-    r'cu[eé]ntame\s+(sobre|acerca)|tell\s+me\s+about|'
-    r'resumen\s+general|general\s+summary|overview|'
-    r'qu[eé]\s+es\s+(el|la)\s+(libro|novela)|what\s+is\s+the\s+book|'
-    r'de\s+qu[eé]\s+habla|what\s+does\s+.*\s+talk\s+about'
-    r')\b',
-    re.IGNORECASE
-)
+        print(f"  Query enriquecida: '{query}' -> '{result}'")
+        return result
+    return query
 
-# Detecta preguntas sobre nombres propios para usar BM25 en vez de vectorial
-_NAME_QUERY_PATTERNS = re.compile(
-    r'\b('
-    r'c[oó]mo\s+se\s+llama[mn]?|nombres?\s+de|how\s+are\s+.*\s+called|'
-    r'what\s+(are\s+the\s+)?names?\s+(of|are)|'
-    r'qui[eé]n(es)?\s+son|who\s+are\s+the|'
-    r'c[oó]mo\s+llaman|llamado[s]?|named?\s+after'
-    r')\b',
-    re.IGNORECASE
-)
+def _rerank(query_en, chunks, preferred_ids=None):
+    """
+    Usa el LLM para evaluar los fragmentos encontrados y reordenarlos.
+    Pone primero los fragmentos que responden de forma más directa a la pregunta.
+    También puede darle prioridad a fragmentos que pertenezcan a libros específicos (preferred_ids).
+    """
+    if len(chunks) <= 2:
+        return chunks
+    snippets = "\n\n".join(
+        f"[{i}] ({(c.get('book') or [{}])[0].get('title', '?')}) "
+        f"{c.get('content', '')[:250]}"
+        for i, c in enumerate(chunks)
+    )
+    preferred_hint = ""
+    if preferred_ids:
+        titles = list({
+            (c.get("book") or [{}])[0].get("title", "")
+            for c in chunks if _book_id(c) in preferred_ids
+            if (c.get("book") or [{}])[0].get("title")
+        })
+        if titles:
+            preferred_hint = (
+                f"IMPORTANT: The question is most likely about: {', '.join(titles)}. "
+                f"Rank passages from those books FIRST if relevant.\n"
+            )
+    raw = _groq([{"role": "user", "content":
+        f"Query: {query_en}\n\n"
+        f"{preferred_hint}"
+        f"Rank these {len(chunks)} passages by relevance. "
+        f"Passages that DIRECTLY answer the question go first. "
+        f"Reply ONLY with a JSON integer array like [2,0,3,1]. No other text.\n\n"
+        f"{snippets}\n\nJSON array:"
+    }], max_tokens=200)
+    if not raw:
+        return chunks
+    match = re.search(r'\[[\d,\s]+\]', raw)
+    if not match:
+        return chunks
+    indices = json.loads(match.group())
+    valid  = [i for i in indices if isinstance(i, int) and 0 <= i < len(chunks)]
+    seen   = set(valid)
+    valid += [i for i in range(len(chunks)) if i not in seen]
+    print(f"  Re-rank top5: {valid[:5]}")
+    return [chunks[i] for i in valid]
 
-# Cache de traducciones en memoria para no repetir llamadas a Groq
-_translation_cache: dict[str, str] = {}
 
-
-def _normalize(s: str) -> str:
-    s = s.lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    s = re.sub(r"[^\w\s]", " ", s)
-    return s
-
-
-def _levenshtein(a: str, b: str) -> int:
+def _levenshtein(a, b):
+    """
+    Calcula la distancia de Levenshtein entre dos palabras.
+    En términos humanos: cuenta cuántas letras tienes que cambiar, agregar o quitar 
+    para transformar la palabra 'a' en la palabra 'b'. Ideal para tolerar errores ortográficos.
+    """
     if len(a) < len(b):
         return _levenshtein(b, a)
     if not b:
@@ -143,808 +273,901 @@ def _levenshtein(a: str, b: str) -> int:
     for ca in a:
         curr = [prev[0] + 1]
         for j, cb in enumerate(b):
-            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+            curr.append(min(prev[j+1]+1, curr[j]+1, prev[j]+(ca != cb)))
         prev = curr
     return prev[-1]
 
-
-def _word_matches(word: str, query_words: list[str]) -> bool:
-    if word in query_words:
+def _fuzzy_word(word, targets):
+    """
+    Verifica si una palabra se parece lo suficiente a alguna de las palabras en una lista destino.
+    Da un margen de error dinámico: permite un error si la palabra es mediana y hasta dos si es larga.
+    """
+    if word in targets:
         return True
     n = len(word)
     if n < 4:
         return False
     max_dist = 2 if n >= 6 else 1
-    return any(_levenshtein(word, qw) <= max_dist for qw in query_words)
+    return any(_levenshtein(word, t) <= max_dist for t in targets)
 
-
-def _chunk_score(c: dict) -> float:
-    try:
-        return float(c.get("_additional", {}).get("score", 0) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _top_score(chunks: list[dict]) -> float:
-    return max((_chunk_score(c) for c in chunks[:5]), default=0.0)
-
-
-def _merge_unique(base: list[dict], extra: list[dict]) -> list[dict]:
-    seen_ids = {c.get("_additional", {}).get("id") for c in base}
-    for c in extra:
-        if c.get("_additional", {}).get("id") not in seen_ids:
-            base.append(c)
-    return base
-
-
-_GLOSSARY_PATTERNS = re.compile(
-    r'^[A-Z\s\'\-]{3,40}:\s',
-    re.MULTILINE
-)
-_APPENDIX_HEADERS = re.compile(
-    r'\b(glossary|glosario|appendix|ap[eé]ndice|bibliography|bibliograf[ií]a|'
-    r'index|[íi]ndice|terminology|terminolog[íi]a|'
-    r'publishing\s+group|orion\s+publishing|gollancz|copyright|'
-    r'all\s+rights\s+reserved|printed\s+in)\b',
-    re.IGNORECASE
-)
-
-
-def _is_junk_chunk(chunk: dict) -> bool:
-    """Descarta chunks que son glosario, indice, apendice o tabla de contenidos."""
-    if chunk.get("chunk_index", 1) == 0:
-        return True
-    content = chunk.get("content", "")
-    lines = [l.strip() for l in content.splitlines() if l.strip()]
-    if not lines:
-        return False
-    chapter_lines = sum(1 for l in lines if re.match(r"^Chapter\s+\d+", l, re.IGNORECASE))
-    if chapter_lines / len(lines) > 0.5:
-        return True
-    glossary_lines = sum(1 for l in lines if _GLOSSARY_PATTERNS.match(l))
-    if len(lines) >= 3 and glossary_lines / len(lines) > 0.5:
-        return True
-    if _APPENDIX_HEADERS.search(content[:300]):
-        return True
-    return False
-
-
-# Score artificial para tail chunks: no deben competir con hits vectoriales reales
-_TAIL_CHUNK_SCORE = 0.4
-
-
-def _apply_score_filter(raw: list[dict]) -> list[dict]:
+def _get_all_books(client):
     """
-    Filtra chunks de baja relevancia.
-    Garantiza al menos un chunk por libro para evitar que un libro con score alto
-    elimine completamente a otro libro que puede tener la respuesta correcta.
+    Se conecta a Weaviate y descarga la lista completa de todos los libros disponibles 
+    con su título y su ID interno. Esto sirve de catálogo base para las funciones de búsqueda.
     """
-    if not raw:
-        return raw
-
-    tail = [c for c in raw if _chunk_score(c) == _TAIL_CHUNK_SCORE]
-    hits = [c for c in raw if _chunk_score(c) != _TAIL_CHUNK_SCORE]
-
-    scores    = [_chunk_score(c) for c in hits] if hits else [0.0]
-    top_score = max(scores) if scores else 0
-    before    = len(hits)
-
-    # Guardar el mejor score de cada libro para protegerlo del filtro
-    book_best_score: dict[str, float] = {}
-    for c in hits:
-        bid = c.get("book_id", "")
-        s   = _chunk_score(c)
-        if bid not in book_best_score or s > book_best_score[bid]:
-            book_best_score[bid] = s
-
-    def _keep(c):
-        s   = _chunk_score(c)
-        bid = c.get("book_id", "")
-        if s == 0.5:
-            return False
-        # El mejor chunk de cada libro siempre pasa
-        if book_best_score.get(bid) == s:
-            return True
-        if top_score >= 0.6 and s < 0.35:
-            return False
-        return True
-
-    filtered = [c for c in hits if _keep(c)]
-    if len(filtered) < MIN_CHUNKS_THRESHOLD:
-        filtered = [c for c in hits if _chunk_score(c) != 0.5]
-        print(f"  Solo score 0.5 filtrado en hits, quedan: {len(filtered)}")
-    elif len(filtered) < before:
-        print(f"  Score filtrados: {before - len(filtered)}, quedan: {len(filtered)}")
-
-    result = filtered + [c for c in tail if c not in filtered]
-    if tail:
-        print(f"  Tail chunks preservados: {len(tail)}")
-    return result
-
-
-def _limit_chunks(chunks: list[dict]) -> list[dict]:
-    selected, total = [], 0
-    for c in chunks:
-        content = c.get("content", "")
-        if len(selected) >= MAX_CHUNKS_TO_LLM:
-            break
-        if total + len(content) > MAX_CONTEXT_CHARS:
-            break
-        selected.append(c)
-        total += len(content)
-    print(f"  Chunks al LLM: {len(selected)} con {total} chars")
-    return selected
-
-
-def _log_chunks(chunks: list[dict]) -> None:
-    for c in chunks[:10]:
-        book_info = (c.get("book") or [{}])[0]
-        print(
-            f"     [{book_info.get('title','?')}] idx={c.get('chunk_index')} "
-            f"score={_chunk_score(c):.4f} | {c.get('content','')[:60]}"
-        )
-
-
-def _call_groq(messages: list[dict], max_tokens: int = 100,
-               temperature: float = 0, timeout: int = 6) -> str | None:
-    if not GROQ_API_KEY:
-        return None
-    try:
-        r = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=timeout,
-        )
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
-        print(f"  Groq error status {r.status_code}")
-    except Exception as e:
-        print(f"  Groq call failed: {e}")
-    return None
-
-
-def _translate_query_llm(query: str) -> str:
-    """Traduce la query al ingles para mejorar la busqueda vectorial. Solo para retrieval, nunca para el LLM final."""
-    if _EN_PATTERN.search(query):
-        return query
-    if query in _translation_cache:
-        cached = _translation_cache[query]
-        print(f"  Query traducida (cache): '{query}' -> '{cached}'")
-        return cached
-    result = _call_groq(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a translator. The user sends short Spanish search queries about books. "
-                    "These are always questions or phrases, never names. "
-                    "Translate to English. Reply ONLY with the translation, nothing else."
-                )
-            },
-            {"role": "user", "content": query}
-        ],
-        max_tokens=80,
-    )
-    if result and result.lower() != query.lower():
-        print(f"  Query traducida: '{query}' -> '{result}'")
-        _translation_cache[query] = result
-        return result
-    return query
-
-
-def _enrich_query_with_history(query: str, history: list, hint_only: bool = False) -> str:
-    """
-    Reemplaza pronombres vagos por nombres reales usando solo las preguntas del historial.
-    Nunca usa las respuestas anteriores porque pueden estar mal y contaminar la busqueda.
-    hint_only=True: solo resuelve pronombres, no agrega nombre de libro para no sesgar.
-    """
-    if not history:
-        return query
-
-    recent = history[-3:]
-    context = "\n".join(
-        f"Q: {t.get('question', '')}"
-        for t in recent
-        if t.get("question", "").strip()
-    )
-
-    if not context.strip():
-        return query
-
-    if hint_only:
-        system_msg = (
-            "You are a search query optimizer for a book RAG system. "
-            "Rewrite the follow-up question using ONLY information present in the previous questions.\n"
-            "Rules:\n"
-            "1. Replace pronouns (he, she, it, el, ella, su, his, her, sus) with the character "
-            "name that appears in the previous questions.\n"
-            "2. For 'why' or 'how' questions about an event explicitly mentioned in a previous "
-            "question (e.g. Q: 'does Paul go blind?' -> follow-up: 'why does he go blind?'), "
-            "rewrite to include the event: e.g. 'Paul Atreides blindness cause'.\n"
-            "3. CRITICAL: Do NOT add any names, facts, or details that do not appear verbatim "
-            "in the previous questions. If unsure, just replace the pronoun and nothing else.\n"
-            "4. Do NOT add book titles.\n"
-            "5. Output ONLY the rewritten query, max 10 words, no explanation."
-        )
-    else:
-        system_msg = (
-            "You are a search query optimizer. "
-            "Given a list of previous questions and a vague follow-up question, "
-            "rewrite the follow-up to be self-contained by replacing pronouns and vague "
-            "references with the actual entities from the context. "
-            "CRITICAL: If the question refers to a continuation (e.g., 'el siguiente libro', "
-            "'la secuela', 'next book', 'despues'), DO NOT replace these terms with the name "
-            "of the previous book. Keep the continuation reference intact. "
-            "Do NOT add extra context, dates, or narrative details. "
-            "Keep the rewritten question as short as possible. "
-            "Reply ONLY with the rewritten question, nothing else."
-        )
-
-    result = _call_groq(
-        messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": f"Previous questions:\n{context}\n\nFollow-up question: {query}"}
-        ],
-        max_tokens=60,
-    )
-    if result and result.lower() != query.lower():
-        result = re.sub(r'^[¡¿]+|[!]+$', '', result).strip()
-        print(f"  Query enriquecida: '{query}' -> '{result}'")
-        return result
-    return query
-
-
-def _rerank_chunks(query_en: str, chunks: list[dict], top_n: int = 10,
-                   preferred_book_id: str | None = None) -> list[dict]:
-    """
-    Reordena chunks por relevancia usando el LLM.
-    Recibe siempre la query en ingles para consistencia.
-    preferred_book_id: libro del historial a priorizar cuando hay contaminacion semantica
-    de otros libros con vocabulario similar (ej: The Antichrist vs DUNE MESSIAH).
-    """
-    if not chunks:
-        return chunks
-
-    preferred_title = None
-    if preferred_book_id:
-        for c in chunks:
-            if c.get("book_id") == preferred_book_id:
-                preferred_title = (c.get("book") or [{}])[0].get("title")
-                break
-
-    snippets = "\n\n".join(
-        f"[{i}] (Book: {(c.get('book') or [{}])[0].get('title', '?')}) {c.get('content', '')[:300]}"
-        for i, c in enumerate(chunks)
-    )
-    preferred_hint = (
-        f"IMPORTANT: The question is most likely answered in '{preferred_title}'. "
-        f"Rank passages from that book first IF they are relevant to the query. "
-        f"Ignore passages from other books if they don't directly answer the question.\n"
-        if preferred_title else ""
-    )
-    prompt = (
-        f"Query: {query_en}\n\n"
-        f"{preferred_hint}"
-        f"Rank these {len(chunks)} passages by relevance to the query. "
-        f"Prioritize passages that DIRECTLY answer the question. "
-        f"If the query asks about a character's death, blindness, or fate, "
-        f"rank passages that explicitly describe that event FIRST, even if they come "
-        f"from the end of the book or have lower retrieval scores. "
-        f"If passages from different books are present, rank those that contain "
-        f"the answer first, regardless of which book was previously discussed.\n"
-        f"You MUST respond with ONLY a JSON array of integers. No text before or after.\n"
-        f"Example for 4 passages: [2,0,3,1]\n\n"
-        f"{snippets}\n\nJSON array:"
-    )
-
-    raw = _call_groq(
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=150,
-        timeout=8,
-    )
-    if not raw:
-        print("  Re-rank fallido, usando orden original")
-        return chunks
-
-    match = re.search(r'\[[\d,\s]+\]', raw)
-    if not match:
-        print("  Re-rank sin array JSON, usando orden original")
-        return chunks
-
-    indices       = json.loads(match.group())
-    valid_indices = [i for i in indices if isinstance(i, int) and 0 <= i < len(chunks)]
-    seen = set(valid_indices)
-    for i in range(len(chunks)):
-        if i not in seen:
-            valid_indices.append(i)
-
-    print(f"  Re-ranked top 5: {valid_indices[:5]}")
-    return [chunks[i] for i in valid_indices][:top_n]
-
-
-def _get_all_books(client) -> list[dict]:
     try:
         result = (
-            client.query
-            .get("Book", ["title"])
-            .with_additional(["id"])
-            .with_limit(200)
-            .do()
+            client.query.get("Book", ["title", "author"])
+            .with_additional(["id"]).with_limit(500).do()
         )
-        return result.get("data", {}).get("Get", {}).get("Book", [])
+        return result.get("data", {}).get("Get", {}).get("Book", []) or []
     except Exception as e:
-        print(f"  Error obteniendo libros: {e}")
+        print(f"  Error listando libros: {e}")
         return []
 
+def _detect_books(text, all_books):
+    """
+    Busca dentro de un texto si el usuario mencionó el título de algún libro de nuestra base de datos.
+    Usa tolerancia a errores ortográficos y verifica que al menos el 60% de las palabras del título coincidan.
+    """
+    words, matched, consumed = _normalize(text).split(), [], set()
+    for book in sorted(all_books, key=lambda b: len(b.get("title", "")), reverse=True):
+        title = book.get("title", "")
+        bid   = book.get("_additional", {}).get("id", "")
+        if not title or not bid:
+            continue
+        title_words = _normalize(title).split()
+        available   = [w for w in words if w not in consumed]
+        hits = sum(1 for w in title_words if _fuzzy_word(w, available))
+        if hits / len(title_words) >= 0.6:
+            matched.append(book)
+            print(f"  Libro detectado: '{title}'")
+            for w in title_words:
+                consumed.add(w)
+    return matched
 
-# Mapea referencias numericas a titulos reales (ej: "dune 2" -> "dune messiah")
-_ORDINAL_SEQUEL_MAP = re.compile(
-    r'\bdune\s+(?:2|dos|ii)\b',
-    re.IGNORECASE
+_SEQUEL_PATTERNS = re.compile(
+    r'\b(siguiente|secuela|continuaci[oó]n|pr[oó]ximo|despu[eé]s|next|sequel|after)\b',
+    re.IGNORECASE,
 )
 
-
-def _normalize_ordinal_titles(text: str) -> str:
-    text = _ORDINAL_SEQUEL_MAP.sub('dune messiah', text)
-    return text
-
-
-def detect_mentioned_book_ids(text: str, client) -> list[str]:
+def _resolve_scope(query, history, client, all_books=None):
     """
-    Detecta libros mencionados en el texto usando fuzzy match.
-    Ordena por longitud descendente para que titulos largos (DUNE MESSIAH) matcheen antes que cortos (DUNE).
+    Define en qué libro(s) debemos enfocar la búsqueda. 
+    Prioriza si el usuario nombró un libro en su pregunta actual. 
+    Si está pidiendo por la 'secuela', obliga a buscar de forma global.
+    Si no menciona nada, revisa el historial reciente para ver de qué libro venían hablando.
     """
-    books = _get_all_books(client)
-    query_words = _normalize(text).split()
-    mentioned   = []
-
-    books_sorted = sorted(books, key=lambda b: len(b.get("title", "")), reverse=True)
-
-    for b in books_sorted:
-        title   = b.get("title", "")
-        book_id = b.get("_additional", {}).get("id", "")
-        if not title or not book_id:
-            continue
-
-        title_words = _normalize(title).split()
-        if not title_words:
-            continue
-
-        if len(title_words) == 1:
-            matched = sum(1 for w in title_words if w in query_words)
-        else:
-            matched = sum(1 for w in title_words if _word_matches(w, query_words))
-
-        ratio = matched / len(title_words)
-        if ratio >= 0.6:
-            mentioned.append(book_id)
-            print(f"  Libro detectado: '{title}' id {book_id[:8]}...")
-            for w in title_words:
-                query_words = [qw for qw in query_words if not _word_matches(w, [qw])]
-
-    return mentioned
-
-
-def _resolve_book_context(query: str, history: list, client) -> tuple[list[str], bool]:
-    """
-    Determina que libro es relevante para la query.
-    Retorna (book_ids, hint_only).
-    hint_only=False: libro mencionado en la query actual, busqueda directa.
-    hint_only=True: libro inferido del historial, buscar en todos los libros.
-    """
-    query_normalized = _normalize_ordinal_titles(query)
-
-    ids_in_query = detect_mentioned_book_ids(query_normalized, client)
-    if ids_in_query:
-        print(f"  Libro confirmado en query actual, busqueda directa")
-        return ids_in_query, False
-
-    if _SEQUEL_PATTERNS.search(query_normalized):
-        print("  Intencion de secuela, busqueda global sin filtro de libro")
+    all_books = all_books or _get_all_books(client)
+    in_query  = _detect_books(query, all_books)
+    if in_query:
+        print("  Scope: libro en query actual")
+        return in_query, False
+    if _SEQUEL_PATTERNS.search(query):
+        print("  Scope: intención de secuela -> búsqueda global")
         return [], False
-
-    if history:
-        for turn in reversed(history[-5:]):
-            question = turn.get("question", "").strip()
-            if not question:
-                continue
-            ids_in_history = detect_mentioned_book_ids(question, client)
-            if ids_in_history:
-                print(f"  Libro inferido de historial, hint_only, busqueda en todos los libros")
-                return ids_in_history, True
-
+    for turn in reversed((history or [])[-6:]):
+        q = turn.get("question", "").strip()
+        if not q:
+            continue
+        in_history = _detect_books(q, all_books)
+        if in_history:
+            print("  Scope: libro inferido del historial (hint_only)")
+            return in_history, True
     return [], False
 
 
-def classify_query(query: str) -> dict:
-    is_summary  = bool(_SUMMARY_PATTERNS.search(query))
-    is_specific = bool(_SPECIFIC_PATTERNS.search(query))
-    is_overview = bool(_OVERVIEW_PATTERNS.search(query))
-    query_type  = "specific" if is_specific else ("summary" if is_summary else "specific")
+_SUMMARY_PATTERNS = re.compile(
+    r'\b('
+    r'qu[eé]\s+(pas[oó]|ocurri[oó]|le\s+pas[oó]|sucedi[oó]|hace|hizo|pasa)|'
+    r'(trata|habla|cuenta)\s+(el|la|los)?\s*(libro|historia|novela)?|'
+    r'resumen|resume|summarize|summary|synopsis|sinopsis|'
+    r'de\s+qu[eé]\s+(trata|va)|what\s+is\s+.*\s+about|'
+    r'cu[eé]ntame|tell\s+me\s+about|'
+    r'qu[eé]\s+rol|what\s+role|'
+    r'tema\s+principal|main\s+theme|temas?|themes?|'
+    r'qu[eé]\s+pasa\s+(en|al|con)|what\s+happens|'
+    r'c[oó]mo\s+(termina|finaliza|acaba)'
+    r')\b',
+    re.IGNORECASE,
+)
 
+_CHARACTER_PATTERNS = re.compile(
+    r'\b('
+    r'hijos?|sons?|daughters?|children|'
+    r'nombre|llama[mn]?|called|named|'
+    r'qui[eé]n\s+es|who\s+is|'
+    r'esposa|esposo|wife|husband|'
+    r'hermano|hermana|brother|sister|'
+    r'padre|madre|father|mother'
+    r')\b',
+    re.IGNORECASE,
+)
+
+_OVERVIEW_PATTERNS = re.compile(
+    r'\b('
+    r'de\s+qu[eé]\s+(trata|va)|what\s+is\s+.*\s+about|'
+    r'resumen\s+general|overview|qu[eé]\s+es\s+(el|la)\s+(libro|novela)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+_POSITION_PATTERNS = {
+    "beginning": re.compile(
+        r'\b(al\s+inicio|al\s+principio|al\s+comienzo|'
+        r'at\s+the\s+(beginning|start)|primera\s+parte|first\s+part)\b',
+        re.IGNORECASE,
+    ),
+    "end": re.compile(
+        r'\b(al\s+final|at\s+the\s+end|c[oó]mo\s+termina|'
+        r'desenlace|ending|[uú]ltima\s+parte|last\s+part)\b',
+        re.IGNORECASE,
+    ),
+}
+
+_QUOTED_TERM = re.compile(r'"[^"]+"')
+
+
+def _classify(query: str, original: str | None = None) -> dict:
+    """
+    Clasifica la pregunta del usuario en categorías (resumen, personaje, específica).
+    Evalúa tanto la pregunta enriquecida como la original del usuario para no perder el sentido.
+    También determina si el usuario pregunta por el 'inicio' o el 'final' del libro, 
+    y ajusta un peso (alpha) que balancea la búsqueda vectorial frente a la búsqueda por palabras clave.
+    """
+    # Combinar ambas queries para clasificar: se evalúan en paralelo
+    # y se toma la clasificación más informativa (summary > character > specific)
+    queries_to_check = [query]
+    if original and original.strip() and original.strip().lower() != query.strip().lower():
+        queries_to_check.append(original)
+
+    is_summary  = any(bool(_SUMMARY_PATTERNS.search(q))  for q in queries_to_check)
+    is_char     = any(bool(_CHARACTER_PATTERNS.search(q)) for q in queries_to_check)
+    is_overview = any(bool(_OVERVIEW_PATTERNS.search(q))  for q in queries_to_check)
+    has_quoted  = any(bool(_QUOTED_TERM.search(q))        for q in queries_to_check)
+
+    # Posición: buscar en ambas queries, la original suele tener "al final", "al inicio"
     position = None
-    for pos, pattern in _POSITION_PATTERNS.items():
-        if pattern.search(query):
-            position = pos
+    for q in queries_to_check:
+        for pos, pattern in _POSITION_PATTERNS.items():
+            if pattern.search(q):
+                position = pos
+                break
+        if position:
             break
 
-    print(f"  Tipo: {query_type}"
-          + (f" posicion: {position}" if position else "")
-          + (f" overview: {is_overview}" if is_overview else ""))
+    if is_summary:
+        query_type = "summary"
+    elif is_char:
+        query_type = "character_lookup"
+    else:
+        query_type = "specific"
 
-    return {"type": query_type, "position": position, "is_overview": is_overview}
+    if query_type == "summary":
+        alpha = 0.85
+    elif query_type == "character_lookup":
+        alpha = 0.75
+    elif has_quoted:
+        alpha = 0.30
+    else:
+        alpha = 0.65
 
+    print(f"  Tipo: {query_type} alpha={alpha}"
+          + (f" pos:{position}" if position else "")
+          + (" overview" if is_overview else "")
+          + (" [quoted]" if has_quoted else ""))
 
-def _expand_and_sort_by_score(client, raw: list[dict], top_n: int,
-                               window: int = 1) -> list[dict]:
-    """Expande los top_n chunks con sus vecinos y reordena por score."""
-    score_map = {
-        c.get("_additional", {}).get("id"): _chunk_score(c)
-        for c in raw
+    return {
+        "type":        query_type,
+        "alpha":       alpha,
+        "position":    position,
+        "is_overview": is_overview,
     }
 
-    top_raw  = raw[:top_n]
-    expanded = expand_chunks_with_neighbors(client, top_raw, window=window)
 
-    for c in expanded:
-        cid = c.get("_additional", {}).get("id")
-        if cid not in score_map:
-            book_id   = c.get("book_id")
-            chunk_idx = c.get("chunk_index", 0)
-            parent_score = 0.0
-            for orig in raw:
-                if orig.get("book_id") == book_id:
-                    diff = abs(orig.get("chunk_index", 0) - chunk_idx)
-                    if diff <= window:
-                        parent_score = max(parent_score, _chunk_score(orig))
-            score_map[cid] = parent_score * 0.95
+_EVENT_SYNONYMS: list[tuple[re.Pattern, list[str]]] = [
+    (
+        re.compile(
+            r'cieg[oa]|blind|pierde\s+la\s+vista|queda\s+ciego|goes?\s+blind',
+            re.IGNORECASE,
+        ),
+        [
+            "blind stone burner blindsight vision eyes",
+            "ciego ojos visión stone burner",
+        ],
+    ),
+    (
+        re.compile(
+            r'muer[et][eo]|murio|muere|muerte|dies?|killed|assassin',
+            re.IGNORECASE,
+        ),
+        [
+            "death dies killed assassination poison",
+            "muerte asesinato muere veneno",
+        ],
+    ),
+    (
+        re.compile(r'traicion|betray', re.IGNORECASE),
+        [
+            "betrayal traitor conspiracy plot",
+            "traición traidor conspiración",
+        ],
+    ),
+    (
+        re.compile(r'herido|wounded|injur', re.IGNORECASE),
+        [
+            "wounded injured battle fight",
+            "herido batalla pelea",
+        ],
+    ),
+    (
+        re.compile(r'cas[ao]|marr(ies?|iage)|boda|matrimonio', re.IGNORECASE),
+        [
+            "marriage wedding ceremony wife husband",
+            "boda matrimonio esposa esposo",
+        ],
+    ),
+]
 
-    expanded.sort(
-        key=lambda c: score_map.get(c.get("_additional", {}).get("id"), 0.0),
-        reverse=True,
-    )
-    print(f"  Total tras expandir: {len(expanded)} chunks")
-    return expanded
+
+def _get_event_synonyms(query: str) -> list[str]:
+    """
+    Busca patrones de eventos comunes en la pregunta (muertes, bodas, traiciones)
+    y devuelve una lista de sinónimos clave en español e inglés.
+    Esto ayuda a Weaviate a encontrar fragmentos aunque el libro use palabras distintas al usuario.
+    """
+    for pattern, synonyms in _EVENT_SYNONYMS:
+        if pattern.search(query):
+            print(f"  Evento detectado: +{len(synonyms)} queries BM25 extra")
+            return synonyms
+    return []
 
 
-def _search_book(client, book: dict, query_en: str, query_orig: str,
-                 search_fn, limit: int, **kwargs) -> list[dict]:
-    """Busca en un unico libro. Se ejecuta en un thread del pool paralelo."""
-    bid     = book.get("_additional", {}).get("id")
-    results = search_fn(client, query_en, limit=limit, book_id=bid, **kwargs)
+def _search_one(client, bid, query_en, query_orig, alpha, extra_bm25=None):
+    """
+    Realiza todas las búsquedas necesarias para UN solo libro. 
+    Hace búsquedas híbridas combinando la pregunta en inglés, la original en español, 
+    y opcionalmente listas de sinónimos extra. Luego junta todos los resultados quitando duplicados.
+    """
+    vector = search_chunks_hybrid(
+        client, query_en, limit=SEARCH_LIMIT, book_id=bid, alpha=alpha)
+    bm25 = search_chunks_hybrid(
+        client, query_en, limit=SEARCH_LIMIT, book_id=bid, alpha=0.0)
+    result = _merge(vector, bm25)
+
     if query_en != query_orig:
-        results = _merge_unique(
-            results,
-            search_fn(client, query_orig, limit=max(1, limit // 2), book_id=bid, **kwargs)
-        )
-    return results
+        orig_v = search_chunks_hybrid(
+            client, query_orig, limit=SEARCH_LIMIT, book_id=bid, alpha=alpha)
+        orig_b = search_chunks_hybrid(
+            client, query_orig, limit=SEARCH_LIMIT, book_id=bid, alpha=0.0)
+        result = _merge(result, _merge(orig_v, orig_b))
+
+    if extra_bm25:
+        for synonym_query in extra_bm25:
+            extra = search_chunks_hybrid(
+                client, synonym_query, limit=6, book_id=bid, alpha=0.0)
+            result = _merge(result, extra)
+
+    return result
 
 
-def _search_all_books(client, query_en: str, query_orig: str,
-                      search_fn, limit: int = LIMIT_VECTOR, **kwargs) -> list[dict]:
-    """Busca en todos los libros en paralelo y combina resultados por score."""
-    books = list_books(client)
-    raw   = []
-
-    with ThreadPoolExecutor(max_workers=min(len(books), 8)) as executor:
+def _search_parallel(client, book_ids, query_en, query_orig, alpha, extra_bm25=None):
+    """
+    Toma una lista de libros y ejecuta la función '_search_one' para todos ellos al mismo tiempo 
+    usando hilos (ThreadPoolExecutor). Agrupa todos los fragmentos encontrados y los ordena 
+    según su puntuación de mayor a menor. Al filtrar libro por libro de entrada, se garantiza
+    que el ranking se calcule adecuadamente para cada contexto separado.
+    """
+    all_chunks = []
+    with ThreadPoolExecutor(max_workers=min(len(book_ids), 8)) as pool:
         futures = {
-            executor.submit(
-                _search_book, client, book, query_en, query_orig, search_fn, limit, **kwargs
-            ): book.get("title", "?")
-            for book in books
+            pool.submit(
+                _search_one, client, bid, query_en, query_orig, alpha, extra_bm25
+            ): bid
+            for bid in book_ids
         }
         for future in as_completed(futures):
-            title = futures[future]
+            bid = futures[future]
             try:
-                results = future.result()
-                print(f"  [{title}]: {len(results)} chunks")
-                raw = _merge_unique(raw, results)
+                chunks = future.result()
+                print(f"  [{bid[:8]}]: {len(chunks)} chunks")
+                all_chunks = _merge(all_chunks, chunks)
             except Exception as e:
-                print(f"  [{title}] error en busqueda paralela: {e}")
-
-    raw.sort(key=_chunk_score, reverse=True)
-    print(f"  Total global: {len(raw)}")
-    return raw
+                print(f"  Error {bid[:8]}: {e}")
+    all_chunks.sort(key=_score, reverse=True)
+    return all_chunks
 
 
-def _fetch_tail_chunks(client, book_id: str, n: int = 15) -> list[dict]:
+def _search_event_global(client, scope_ids, other_ids,
+                         query_en, query_orig, alpha, extra_bm25):
     """
-    Recupera los ultimos N chunks narrativos de un libro ordenados por indice descendente.
-    Pide n*4 al backend para tener margen despues de filtrar junk (glosario, apendice).
-    Asigna score artificial 0.4 para no desplazar hits vectoriales reales.
+    Orquesta una búsqueda de alcance global dividida en dos grupos paralelos: 
+    los libros principales del contexto actual (scope_ids) y el resto del catálogo (other_ids).
+    Sirve especialmente cuando se está buscando un evento clave y no estamos seguros en qué libro ocurre.
     """
-    gql = f"""
-    {{
-      Get {{
-        BookChunk(
-          where: {{
-            path: ["book_id"]
-            operator: Equal
-            valueText: "{book_id}"
-          }}
-          sort: [{{ path: ["chunk_index"], order: desc }}]
-          limit: {n * 4}
-        ) {{
-          content
-          chunk_index
-          book_id
-          book {{ ... on Book {{ title }} }}
-          _additional {{ id }}
-        }}
-      }}
-    }}
+    print(f"  Búsqueda evento — fase 1: scope ({len(scope_ids)} libro(s))")
+    scope_chunks = _search_parallel(
+        client, list(scope_ids), query_en, query_orig, alpha, extra_bm25)
+
+    other_chunks = []
+    if other_ids:
+        print(f"  Búsqueda evento — fase 2: otros ({len(other_ids)} libro(s))")
+        other_chunks = _search_parallel(
+            client, list(other_ids), query_en, query_orig, alpha, extra_bm25)
+
+    merged = _merge(scope_chunks, other_chunks)
+    print(f"  Merge evento: {len(scope_chunks)} scope + {len(other_chunks)} otros "
+          f"= {len(merged)} total")
+    return merged
+
+
+def _cap_foreign(chunks, scope_ids):
     """
-    try:
-        result = client.query.raw(gql)
-        chunks = result.get("data", {}).get("Get", {}).get("BookChunk", [])
-        before = len(chunks)
-        chunks = [c for c in chunks if not _is_junk_chunk(c)]
-        if before != len(chunks):
-            print(f"  Tail junk filtrados: {before - len(chunks)}")
-        chunks = chunks[:n]
-        for c in chunks:
-            c.setdefault("_additional", {})["score"] = 0.4
-        if chunks:
-            max_idx = max(c.get("chunk_index", 0) for c in chunks)
-            min_idx = min(c.get("chunk_index", 0) for c in chunks)
-            print(f"  Tail chunks recuperados: {len(chunks)} (idx {min_idx}-{max_idx})")
+    Controla el "ruido" de libros que no pertenecen al contexto original.
+    Permite que pasen todos los fragmentos de los libros principales (scope_ids),
+    pero pone un límite estricto de cuántos fragmentos pueden colarse de libros secundarios.
+    """
+    result, counts = [], {}
+    for c in chunks:
+        bid = _book_id(c)
+        if bid in scope_ids:
+            result.append(c)
         else:
-            print("  Tail chunks: 0 resultados (todo era glosario/apendice)")
+            counts[bid] = counts.get(bid, 0) + 1
+            if counts[bid] <= FOREIGN_CAP:
+                result.append(c)
+    removed = len(chunks) - len(result)
+    if removed:
+        print(f"  Cap foreign: -{removed} chunks fuera de scope")
+    return result
+
+
+def _expand_scope_ids(raw, scope_ids, top_n=6):
+    """
+    Revisa si entre los primeros resultados aparece un fragmento excepcional (con score mayor a 0.75) 
+    de un libro que no estaba inicialmente en nuestro enfoque principal.
+    Si lo encuentra, "expande" el alcance añadiendo ese nuevo libro a nuestro contexto oficial.
+    """
+    top_books = {
+        _book_id(c) for c in raw[:top_n]
+        if _score(c) >= 0.75 and _book_id(c) not in scope_ids
+    }
+    if top_books:
+        print(f"  Scope expandido con: {top_books}")
+    return scope_ids | top_books
+
+
+def _expand_top_chunks(client, chunks):
+    """
+    Toma los fragmentos con las puntuaciones más altas y busca en la base de datos 
+    el fragmento inmediatamente anterior y el inmediatamente posterior.
+    Esto permite entregarle al LLM un "bloque" de contexto narrativo más grueso y continuo.
+    """
+    candidates = [c for c in chunks if _score(c) >= NEIGHBOR_SCORE][:NEIGHBOR_TOP_N]
+    if not candidates:
+        print("  Sin vecinos (ningún chunk supera umbral)")
         return chunks
-    except Exception as e:
-        print(f"  Error fetching tail chunks: {e}")
-        return []
+    expanded = expand_chunks_with_neighbors(client, candidates, window=1)
+    expanded = [c for c in expanded if not _is_junk(c)]
+    result   = _merge(chunks, expanded)
+    print(f"  Vecinos: +{len(result) - len(chunks)} chunks "
+          f"(de {len(candidates)} chunks con score >= {NEIGHBOR_SCORE})")
+    return result
 
 
-def _search_specific(client, query: str, book_id: str | None,
-                     hint_only: bool = False,
-                     position: str | None = None) -> list[dict]:
+_COMPARISON_PATTERNS = re.compile(
+    r'\b('
+    # Similitudes
+    r'en\s+qu[eé]\s+se\s+parece[n]?|'
+    r'qu[eé]\s+tienen\s+en\s+com[uú]n|'
+    r'similitudes?|similarit(?:y|ies)|'
+    r'parecido[s]?|parecida[s]?|similar(?:es)?|'
+    r'se\s+asemeja[n]?|resembl(?:e|es|ance)|'
+    r'compara[r]?\s+con|compare[sd]?\s+to|'
+    r'al\s+igual\s+que|just\s+like|'
+    # Diferencias
+    r'en\s+qu[eé]\s+se\s+diferencia[n]?|'
+    r'diferencia[s]?\s+entre|difference[s]?\s+between|'
+    r'a\s+diferencia\s+de|unlike|'
+    r'contrario\s+a|contrast(?:s|ed)?\s+with|'
+    r'mejor\s+que|worse\s+than|m[aá]s\s+\w+\s+que|'
+    # Comparación general
+    r'comparaci[oó]n|comparison|'
+    r'versus|vs\.?|'
+    r'frente\s+a|compared?\s+to|'
+    r'tanto\s+\w+\s+como|both\s+\w+\s+and'
+    r')\b',
+    re.IGNORECASE,
+)
+
+_ENTITY_SEPARATORS = re.compile(
+    r'\s+(?:y|e|and|vs\.?|versus|con|with|or|o|compared?\s+to|frente\s+a|'
+    r'al\s+igual\s+que|tanto\s+como|as\s+well\s+as)\s+',
+    re.IGNORECASE,
+)
+
+_COMPARISON_STOPWORDS = {
+    "el", "la", "los", "las", "un", "una", "unos", "unas",
+    "the", "a", "an", "of", "in", "on", "at", "to", "for",
+    "que", "de", "en", "con", "por", "para", "se", "su", "sus",
+    "es", "son", "era", "eran", "fue", "were", "was", "is", "are",
+    "esto", "este", "esta", "estos", "estas",
+    "this", "that", "these", "those",
+    "como", "as", "like",
+}
+
+_INTRO_PHRASES = re.compile(
+    r'^(en\s+qu[eé]\s+se\s+parece[n]?\s+|'
+    r'qu[eé]\s+tienen\s+en\s+com[uú]n\s+|'
+    r'cu[aá]les\s+son\s+las\s+similitudes\s+(?:entre\s+)?|'
+    r'cu[aá]les\s+son\s+las\s+diferencias\s+(?:entre\s+)?|'
+    r'compara\s+|compare\s+|'
+    r'diferencias?\s+entre\s+|'
+    r'similitudes?\s+entre\s+|'
+    r'what\s+(?:do|does|are|is)\s+\w+\s+(?:and\s+\w+\s+)?have\s+in\s+common\s*|'
+    r'how\s+(?:is|are)\s+\w+\s+similar\s+to\s+)',
+    re.IGNORECASE,
+)
+
+_SIMILARITY_PATTERNS = re.compile(
+    r'\b(similar|parecido|parece|resembl|en\s+com[uú]n|'
+    r'alike|same|igual|tambi[eé]n|also|both|ambos)\b',
+    re.IGNORECASE,
+)
+_DIFFERENCE_PATTERNS = re.compile(
+    r'\b(diferencia|difference|distinto|unlike|contrario|'
+    r'contrast|versus|vs|mejor\s+que|worse|opuesto)\b',
+    re.IGNORECASE,
+)
+
+
+def _detect_comparison_type(query: str) -> str:
     """
-    Pipeline para preguntas especificas sobre eventos, personajes o hechos concretos.
-    hint_only=True: busca en todos los libros en paralelo.
-    hint_only=False: busca directamente en el libro confirmado.
-    position='end': inyecta los ultimos chunks del libro para cubrir desenlaces.
+    Revisa si una pregunta comparativa está buscando similitudes específicas, 
+    diferencias específicas, o si es una comparación general sin un sesgo claro.
     """
-    query_en = _translate_query_llm(query)
-
-    if hint_only or not book_id:
-        raw = _search_all_books(
-            client, query_en, query,
-            search_fn=search_chunks_hybrid,
-            limit=LIMIT_VECTOR,
-            alpha=0.5,
-        )
-        if _top_score(raw) < BM25_SKIP_THRESHOLD:
-            raw = _merge_unique(raw, _search_all_books(
-                client, query_en, query,
-                search_fn=search_chunks_hybrid,
-                limit=LIMIT_BM25,
-                alpha=0.0,
-            ))
-            raw.sort(key=_chunk_score, reverse=True)
-        else:
-            print(f"  BM25 omitida (top score={_top_score(raw):.4f} >= {BM25_SKIP_THRESHOLD})")
-
-        # Si el libro del historial no aparece en los top-5, forzar busqueda directa en el.
-        # Previene que libros con vocabulario filosofico similar (The Antichrist) dominen
-        # queries sobre eventos narrativos de DUNE MESSIAH.
-        if hint_only and book_id and raw:
-            top5_books = {c.get("book_id") for c in raw[:5]}
-            if book_id not in top5_books:
-                print(f"  Libro del historial ausente del top-5, busqueda directa en {book_id[:8]}...")
-                fallback = search_chunks_hybrid(client, query_en, limit=10, book_id=book_id, alpha=0.5)
-                fallback = _merge_unique(fallback, search_chunks_hybrid(
-                    client, query_en, limit=10, book_id=book_id, alpha=0.0))
-                if query_en != query:
-                    fallback = _merge_unique(fallback, search_chunks_hybrid(
-                        client, query, limit=8, book_id=book_id, alpha=0.5))
-                print(f"  Fallback directo: {len(fallback)} chunks adicionales")
-                raw = _merge_unique(raw, fallback)
-                raw.sort(key=_chunk_score, reverse=True)
-
-        if position == "end" and raw:
-            char_words = [
-                w for w in _normalize(query).split()
-                if len(w) >= 4 and w not in {
-                    "muere", "murio", "muerte", "dies", "dead", "killed",
-                    "last", "libro", "book", "saga", "final", "pasa", "what",
-                    "does", "happen", "happens", "the", "end", "fate", "Ultimo"
-                }
-            ]
-            top_hits = raw[:15]
-            saga_books: dict[str, float] = {}
-            for c in top_hits:
-                bid = c.get("book_id")
-                if not bid:
-                    continue
-                content_lower = c.get("content", "").lower()
-                char_present = not char_words or any(w in content_lower for w in char_words)
-                if char_present:
-                    score = _chunk_score(c)
-                    if bid not in saga_books or score > saga_books[bid]:
-                        saga_books[bid] = score
-            best_saga_book = max(saga_books, key=saga_books.get) if saga_books else None
-            if best_saga_book:
-                print(f"  position=end global, tail chunks de {best_saga_book[:8]}...")
-                raw = _merge_unique(raw, _fetch_tail_chunks(client, best_saga_book, n=30))
-                raw.sort(key=_chunk_score, reverse=True)
-
-    else:
-        # Para nombres propios BM25 es mejor que vectorial porque hace match exacto de tokens
-        is_name_query = bool(_NAME_QUERY_PATTERNS.search(query))
-        if is_name_query:
-            print("  Query de nombre, BM25 primero para match exacto")
-            raw = search_chunks_hybrid(client, query, limit=15, book_id=book_id, alpha=0.0)
-            raw = _merge_unique(raw, search_chunks_hybrid(
-                client, query_en, limit=15, book_id=book_id, alpha=0.0))
-            raw = _merge_unique(raw, search_chunks_hybrid(
-                client, query_en, limit=10, book_id=book_id, alpha=0.5))
-        else:
-            raw = search_chunks_hybrid(client, query_en, limit=15, book_id=book_id, alpha=0.5)
-            raw = _merge_unique(raw, search_chunks_hybrid(
-                client, query_en, limit=15, book_id=book_id, alpha=0.0))
-            if query_en != query:
-                raw = _merge_unique(raw, search_chunks_hybrid(
-                    client, query, limit=12, book_id=book_id, alpha=0.5))
-                raw = _merge_unique(raw, search_chunks_hybrid(
-                    client, query, limit=12, book_id=book_id, alpha=0.0))
-
-        raw.sort(key=_chunk_score, reverse=True)
-
-        if _top_score(raw) < MIN_RELEVANCE_SCORE or len(raw) < MIN_CHUNKS_THRESHOLD:
-            print(f"  Score bajo o pocos chunks ({len(raw)}), ampliando a todos los libros...")
-            raw = _merge_unique(raw, _search_all_books(
-                client, query_en, query,
-                search_fn=search_chunks_hybrid,
-                limit=LIMIT_VECTOR,
-                alpha=0.5,
-            ))
-            raw.sort(key=_chunk_score, reverse=True)
-
-        if position == "end" or _top_score(raw) < MIN_RELEVANCE_SCORE:
-            reason = "posicion end" if position == "end" else f"score bajo ({_top_score(raw):.4f})"
-            print(f"  Inyectando tail chunks ({reason})...")
-            raw = _merge_unique(raw, _fetch_tail_chunks(client, book_id, n=30))
-            raw.sort(key=_chunk_score, reverse=True)
-
-    before = len(raw)
-    raw    = [c for c in raw if not _is_junk_chunk(c)]
-    print(f"  Junk filtrados: {before - len(raw)}, quedan: {len(raw)}")
-    raw = _apply_score_filter(raw)
-    _log_chunks(raw)
-
-    has_tail = any(_chunk_score(c) == _TAIL_CHUNK_SCORE for c in raw)
-    if has_tail:
-        top_n_expand = min(len(raw), MAX_CHUNKS_TO_LLM + 5)
-        print(f"  Tail chunks detectados, expand top_n={top_n_expand}")
-    else:
-        top_n_expand = TOP_N_EXPAND_GLOBAL if (hint_only or not book_id) else TOP_N_EXPAND_DIRECT
-
-    expanded = _expand_and_sort_by_score(client, raw, top_n=top_n_expand, window=1)
-
-    # Garantizar al menos 4 chunks del libro del historial en el pool del re-ranker.
-    # Sin esto, libros con scores altos monopolizan los slots del expand y el libro
-    # correcto nunca llega al LLM.
-    MIN_BOOK_CHUNKS = 4
-    if hint_only and book_id:
-        book_chunks_in_expanded = [c for c in expanded if c.get("book_id") == book_id]
-        if len(book_chunks_in_expanded) < MIN_BOOK_CHUNKS:
-            history_book_chunks = sorted(
-                [c for c in raw if c.get("book_id") == book_id],
-                key=_chunk_score, reverse=True
-            )[:MIN_BOOK_CHUNKS]
-            expanded_ids = {c.get("_additional", {}).get("id") for c in expanded}
-            missing = [c for c in history_book_chunks
-                       if c.get("_additional", {}).get("id") not in expanded_ids]
-            if missing:
-                print(f"  Garantia de representacion: +{len(missing)} chunks de libro del historial")
-                expanded = expanded + missing
-
-    preferred = book_id if hint_only else None
-    reranked = _rerank_chunks(query_en, expanded, top_n=MAX_CHUNKS_TO_LLM + 2,
-                              preferred_book_id=preferred)
-    return _limit_chunks(reranked)
+    if _SIMILARITY_PATTERNS.search(query):
+        return "similarity"
+    if _DIFFERENCE_PATTERNS.search(query):
+        return "difference"
+    return "general"
 
 
-def _search_summary(client, query: str, book_id: str | None,
-                    position: str | None, hint_only: bool = False,
-                    is_overview: bool = False) -> list[dict]:
-    """Pipeline para preguntas de resumen usando BookSummary."""
-    query_en = _translate_query_llm(query)
+def _extract_entity_names(query: str) -> list[str]:
+    """
+    Limpia la pregunta comparativa eliminando frases introductorias (como "en qué se parece")
+    y usa separadores (como "y", "vs") para extraer únicamente los nombres de los sujetos
+    o cosas que se están intentando comparar.
+    """
+    clean = _INTRO_PHRASES.sub("", query).strip()
+    parts = _ENTITY_SEPARATORS.split(clean)
+    entities = []
+    for part in parts:
+        part = re.sub(r'[?¿!¡.,;:]+$', '', part).strip()
+        words = part.split()
+        filtered = [w for w in words if _normalize(w) not in _COMPARISON_STOPWORDS]
+        if filtered:
+            entities.append(part)
+    return [e for e in entities if len(e) > 1]
 
-    if book_id and not hint_only and (is_overview or not position):
-        overview_chunks = search_summaries_hybrid(
-            client, query_en, limit=2, book_id=book_id,
-            position="overview", alpha=0.75,
-        )
-        if overview_chunks:
-            print("  Overview encontrado, combinando con summaries normales")
-            raw = _merge_unique(
-                overview_chunks,
-                search_summaries_hybrid(
-                    client, query_en, limit=4, book_id=book_id,
-                    position=position, alpha=0.75,
-                )
-            )
-            return _limit_chunks(raw)
 
-    raw = search_summaries_hybrid(
-        client, query_en, limit=6, book_id=book_id,
-        position=position, alpha=0.75,
+def _match_entity_to_book(entity_name: str, all_books: list[dict]) -> dict | None:
+    """
+    Intenta relacionar una de las entidades extraídas de la comparación con algún 
+    libro conocido de la base de datos usando un algoritmo que tolera errores al escribir.
+    Devuelve el libro encontrado o None si no hace match.
+    """
+    entity_words = _normalize(entity_name).split()
+    best_match, best_score = None, 0.0
+
+    for book in sorted(all_books, key=lambda b: len(b.get("title", "")), reverse=True):
+        title = book.get("title", "")
+        if not title:
+            continue
+        title_words = _normalize(title).split()
+        hits = 0
+        for ew in entity_words:
+            for tw in title_words:
+                n = max(len(ew), len(tw))
+                if n < 4:
+                    if ew == tw:
+                        hits += 1
+                        break
+                else:
+                    max_dist = 2 if n >= 6 else 1
+                    if _levenshtein(ew, tw) <= max_dist:
+                        hits += 1
+                        break
+        if title_words:
+            score = hits / len(title_words)
+            if score >= 0.6 and score > best_score:
+                best_score = score
+                best_match = book
+
+    return best_match
+
+
+def _detect_comparison(query: str, enriched: str, all_books: list[dict]) -> dict | None:
+    """
+    Evalúa la pregunta completa para determinar si efectivamente el usuario está haciendo una comparación.
+    Si encuentra al menos 2 entidades, empaqueta todos los metadatos (tipo de comparación, nombres detectados,
+    libros relacionados) en un diccionario especial para que el resto del sistema lo procese.
+    """
+    use_query = enriched or query
+    if not _COMPARISON_PATTERNS.search(use_query):
+        return None
+
+    print(f"  [Comparison] Detectada en: '{use_query}'")
+
+    entity_names = _extract_entity_names(use_query)
+    print(f"  [Comparison] Entidades: {entity_names}")
+
+    if len(entity_names) < 2:
+        print("  [Comparison] < 2 entidades → pipeline normal")
+        return None
+
+    comparison_type = _detect_comparison_type(use_query)
+    entities = []
+
+    for name in entity_names[:4]:  # máximo 4 entidades
+        matched_book = _match_entity_to_book(name, all_books)
+        book_id      = matched_book.get("_additional", {}).get("id") if matched_book else None
+        book_title   = matched_book.get("title", "") if matched_book else ""
+
+        search_queries = [name]
+        if book_title and book_title.lower() not in name.lower():
+            search_queries.append(f"{name} {book_title}")
+
+        entities.append({
+            "name":           name,
+            "book":           matched_book,
+            "book_id":        book_id,
+            "book_title":     book_title,
+            "search_queries": search_queries,
+        })
+        print(f"  [Comparison] '{name}' → '{book_title or 'libro no detectado'}'")
+
+    book_ids = {e["book_id"] for e in entities if e["book_id"]}
+    cross_book = len(book_ids) > 1
+
+    return {
+        "type":      comparison_type,
+        "entities":  entities,
+        "cross_book": cross_book,
+    }
+
+
+def _search_one_entity(client, entity: dict, query_en: str, query_orig: str,
+                       alpha: float, extra_bm25: list[str] | None,
+                       limit: int = 8) -> list[dict]:
+    """
+    Realiza la búsqueda de fragmentos para una única entidad dentro de una comparación.
+    Filtra los resultados estrictamente por el libro al que pertenece la entidad (si lo hay)
+    y luego añade etiquetas ocultas a los fragmentos devueltos indicando a qué entidad pertenecen,
+    para que posteriormente no se mezclen sin control en el resultado final.
+    """
+    book_id    = entity.get("book_id")
+    entity_name = entity["name"]
+    chunks     = []
+
+    for sq in entity["search_queries"]:
+        v = search_chunks_hybrid(client, sq, limit=limit, book_id=book_id, alpha=alpha)
+        b = search_chunks_hybrid(client, sq, limit=limit, book_id=book_id, alpha=0.0)
+        chunks = _merge(chunks, v)
+        chunks = _merge(chunks, b)
+
+    # Query original enriquecida con nombre de entidad
+    if query_en != query_orig:
+        combined = f"{entity_name} {query_orig}"
+        v2 = search_chunks_hybrid(
+            client, combined, limit=limit // 2, book_id=book_id, alpha=alpha)
+        chunks = _merge(chunks, v2)
+
+    # Sinónimos de evento si los hay
+    if extra_bm25:
+        for synonym in extra_bm25:
+            sq_syn = f"{entity_name} {synonym}"
+            s = search_chunks_hybrid(client, sq_syn, limit=4, book_id=book_id, alpha=0.0)
+            chunks = _merge(chunks, s)
+
+    # Etiquetar chunks con la entidad de origen para que el LLM sepa de quién habla
+    for chunk in chunks:
+        chunk["__comparison_entity__"] = entity_name
+        chunk["__comparison_book__"]   = entity.get("book_title", "")
+
+    print(f"  [Comparison] '{entity_name}': {len(chunks)} chunks")
+    return chunks
+
+
+def _interleave_comparison(results_by_entity: dict[str, list[dict]],
+                           max_total: int) -> list[dict]:
+    """
+    Mezcla equitativamente los fragmentos encontrados para las distintas entidades.
+    Usa un sistema por turnos (round-robin) para asegurar que si se busca a "Batman y Superman", 
+    el resultado final contenga fragmentos balanceados de ambos, empezando por el que 
+    haya sacado un fragmento con mayor nivel de relevancia.
+    """
+    entity_order = sorted(
+        results_by_entity.keys(),
+        key=lambda n: _score(results_by_entity[n][0]) if results_by_entity[n] else 0,
+        reverse=True,
     )
+    pointers = {name: 0 for name in entity_order}
+    result, seen_ids = [], set()
 
-    if len(raw) < MIN_CHUNKS_THRESHOLD and position:
-        print("  Pocos summaries con posicion, buscando sin filtro...")
-        raw = _merge_unique(raw, search_summaries_hybrid(
-            client, query_en, limit=6, book_id=book_id,
-            position=None, alpha=0.75))
+    while len(result) < max_total:
+        added = False
+        for name in entity_order:
+            if len(result) >= max_total:
+                break
+            idx    = pointers[name]
+            chunks = results_by_entity[name]
+            if idx >= len(chunks):
+                continue
+            chunk = chunks[idx]
+            pointers[name] += 1
+            cid = _chunk_id(chunk)
+            if cid and cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            result.append(chunk)
+            added = True
+        if not added:
+            break
 
-    top = _top_score(raw)
-    if hint_only or not book_id or top < MIN_RELEVANCE_SCORE:
-        print(f"  Top score: {top:.4f} o hint_only, ampliando summaries a todos los libros...")
-        extra = search_summaries_hybrid(
-            client, query_en, limit=6, position=position, alpha=0.75)
-        raw = _merge_unique(raw, extra)
-        raw.sort(key=_chunk_score, reverse=True)
+    return result
 
-    if not raw:
-        print("  Sin summaries, fallback a BookChunk...")
-        raw = search_chunks_hybrid(client, query_en, limit=15, book_id=book_id, alpha=0.5)
-        raw = _merge_unique(raw, search_chunks_hybrid(
-            client, query_en, limit=15, book_id=book_id, alpha=0.0))
-        raw = [c for c in raw if not _is_junk_chunk(c)]
-        raw = expand_chunks_with_neighbors(client, raw, window=1)
-    elif position == "end" and book_id:
-        print("  Posicion end, complementando summaries con chunks del final...")
-        end_chunks = search_chunks_hybrid(client, query_en, limit=8, book_id=book_id, alpha=0.5)
-        end_chunks = [c for c in end_chunks if not _is_junk_chunk(c)]
-        raw = _merge_unique(raw, end_chunks)
-        raw.sort(key=_chunk_score, reverse=True)
 
-    return _limit_chunks(raw)
+def _search_comparison(comparison: dict, client, query_en: str, query_orig: str,
+                       alpha: float, extra_bm25: list[str] | None,
+                       max_per_entity: int = 4) -> list[dict]:
+    """
+    Es el coordinador maestro para responder a preguntas comparativas. 
+    Lanza hilos paralelos para buscar cada entidad por su cuenta (_search_one_entity),
+    luego filtra la 'basura' de cada resultado, y finalmente los intercala limpiamente 
+    (_interleave_comparison) para que el LLM reciba una lista de contextos balanceada y etiquetada.
+    """
+    entities = comparison["entities"]
+    print(f"\n  [Comparison] Buscando {len(entities)} entidades en paralelo")
+
+    results_by_entity: dict[str, list[dict]] = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(entities), 4)) as pool:
+        futures = {
+            pool.submit(
+                _search_one_entity,
+                client, entity, query_en, query_orig, alpha, extra_bm25
+            ): entity["name"]
+            for entity in entities
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                chunks = future.result()
+                # Filtrar junk y score mínimo dentro de cada entidad
+                chunks = [c for c in chunks if not _is_junk(c) and _score(c) >= MIN_SCORE]
+                chunks.sort(key=_score, reverse=True)
+                results_by_entity[name] = chunks[:max_per_entity]
+            except Exception as e:
+                print(f"  [Comparison] Error en '{name}': {e}")
+                results_by_entity[name] = []
+
+    # Log resumen por entidad
+    print(f"\n  [Comparison] Chunks por entidad tras filtros:")
+    for name, chunks in results_by_entity.items():
+        scores = [f"{_score(c):.3f}" for c in chunks]
+        print(f"    '{name}': {len(chunks)} chunks — scores: {scores}")
+
+    # Intercalar para balancear
+    interleaved = _interleave_comparison(results_by_entity, max_total=MAX_CHUNKS_LLM)
+
+    print(f"  [Comparison] Total intercalado: {len(interleaved)} chunks")
+    for c in interleaved:
+        entity = c.get("__comparison_entity__", "?")
+        book   = c.get("__comparison_book__", "?")
+        idx    = c.get("chunk_index", "?")
+        sc     = _score(c)
+        print(f"    [{entity}][{book}] idx={idx} score={sc:.4f} | "
+              f"{c.get('content', '')[:60]}")
+
+    return interleaved
 
 
 def search_chunks(query: str, history: list | None = None) -> list[dict]:
     """
-    Punto de entrada principal del pipeline RAG.
-    1. Detecta el libro en la query actual.
-    2. Si no hay libro en la query, busca en el historial (hint_only=True).
-    3. hint_only=True: busca en todos los libros en paralelo.
-    4. Sin libro detectado y multiples libros disponibles: pide aclaracion al usuario.
+    Pipeline RAG v2.5
+
+    Esta es la función principal que gobierna todo el proceso de recuperación de información.
+    Los pasos principales que orquesta son:
+    1. Define el alcance (qué libro o si debe pedir aclaración al usuario).
+    2. Enriquece la consulta (resuelve pronombres apoyándose en el historial reciente).
+    3. Detecta si es una pregunta comparativa (si lo es, despacha el flujo hacia el orquestador de comparaciones y termina).
+    4. Clasifica la pregunta si no fue comparativa (busca si es un resumen o datos específicos).
+    5. Carga listas de sinónimos de eventos y traduce la consulta al inglés para vectorización.
+    6. Lanza las búsquedas necesarias en los libros adecuados de forma paralela.
+    7. Pone los resúmenes en primer lugar si el usuario estaba pidiendo de qué se trata un libro.
+    8. Filtra la basura y limita la injerencia de libros que no forman parte del tema central.
+    9. Expande los fragmentos de mayor puntaje agregando contexto adyacente del libro original.
+    10. Usa un LLM externo para reordenar (rerank) la selección final con más precisión.
+    11. Corta la lista final y la devuelve lista para procesar en la respuesta de la IA.
     """
-    client = current_app.config["WEAVIATE_CLIENT"]
+    client  = current_app.config["WEAVIATE_CLIENT"]
+    history = history or []
 
-    mentioned_ids, hint_only = _resolve_book_context(query, history or [], client)
-    enriched_query = _enrich_query_with_history(query, history or [], hint_only=hint_only)
+    # Fetching all_books una sola vez y reusar en scope, enrich y comparison.
+    all_books = _get_all_books(client)
+    matched_books, hint_only = _resolve_scope(query, history, client, all_books=all_books)
 
-    classification = classify_query(enriched_query)
-    query_type     = classification["type"]
-    position       = classification["position"]
-    is_overview    = classification["is_overview"]
-
-    if not mentioned_ids:
-        available = list_books(client)
-        if len(available) > 1:
-            print("  Sin libro detectado en query ni historial, solicitando aclaracion")
+    if not matched_books:
+        if len(all_books) > 1:
+            print("  Sin libro detectado -> pidiendo aclaración")
             return [{"__ask_user__": True}]
+        matched_books = all_books
 
-    book_id = mentioned_ids[0] if len(mentioned_ids) == 1 else None
+    scope_ids = {
+        b.get("_additional", {}).get("id")
+        for b in matched_books
+        if b.get("_additional", {}).get("id")
+    }
 
-    if query_type == "summary":
-        print("  Modo summary, usando BookSummary")
-        return _search_summary(
-            client, enriched_query, book_id, position,
-            hint_only=hint_only,
-            is_overview=is_overview,
+    # Pasar all_books para que _enrich_query detecte si el resultado
+    # elimina un título de libro que estaba en la query original.
+    enriched = _enrich_query(query, history, all_books=all_books)
+
+    # Se evalúa DESPUÉS de enriquecer (pronombres ya resueltos)
+    # y ANTES del resto del pipeline (tiene su propio return).
+    comparison = _detect_comparison(query, enriched, all_books)
+    if comparison:
+        _extra_bm25_cmp = _get_event_synonyms(enriched)
+        _query_en_cmp   = _to_english(enriched)
+        _alpha_cmp      = _classify(enriched, original=query)["alpha"]
+        return _search_comparison(
+            comparison, client,
+            _query_en_cmp, enriched,
+            _alpha_cmp, _extra_bm25_cmp,
         )
+
+    # Se pasa también la query original para no perder señales que
+    # el enriquecedor haya eliminado (ej: "al final", "qué pasa")
+    classification = _classify(enriched, original=query)
+    alpha = classification["alpha"]
+
+    # Sinónimos de evento
+    extra_bm25 = _get_event_synonyms(enriched)
+
+    # Traducir
+    query_en = _to_english(enriched)
+
+    # Chunks
+    force_global = bool(extra_bm25) and hint_only
+
+    if force_global:
+        all_ids = {
+            b.get("_additional", {}).get("id")
+            for b in all_books
+            if b.get("_additional", {}).get("id")
+        }
+        other_ids = all_ids - scope_ids
+        raw = _search_event_global(
+            client, scope_ids, other_ids, query_en, enriched, alpha, extra_bm25)
+
+    elif hint_only:
+        all_ids = [
+            b.get("_additional", {}).get("id")
+            for b in all_books
+            if b.get("_additional", {}).get("id")
+        ]
+        print(f"  Búsqueda global hint_only ({len(all_ids)} libros) alpha={alpha}")
+        raw = _search_parallel(client, all_ids, query_en, enriched, alpha, extra_bm25)
+
     else:
-        print("  Modo specific, usando BookChunk")
-        return _search_specific(client, enriched_query, book_id,
-                                hint_only=hint_only, position=position)
+        print(f"  Búsqueda directa ({len(scope_ids)} libro(s)) alpha={alpha}")
+        raw = _search_parallel(
+            client, list(scope_ids), query_en, enriched, alpha, extra_bm25)
+
+    # Summary-first
+    summaries_raw = []
+    if classification["type"] == "summary":
+        book_id_for_summary = next(iter(scope_ids), None) if not hint_only else None
+
+        summaries_raw = search_summaries_hybrid(
+            client, query_en, limit=4,
+            book_id=book_id_for_summary,
+            position=classification["position"],
+            alpha=0.85,
+        )
+
+        if classification["is_overview"] and book_id_for_summary:
+            overviews = search_summaries_hybrid(
+                client, query_en, limit=2,
+                book_id=book_id_for_summary,
+                position="overview", alpha=0.85,
+            )
+            summaries_raw = _merge(overviews, summaries_raw)
+
+        if summaries_raw:
+            print(f"  Summaries: {len(summaries_raw)} traídos")
+            raw = _merge(summaries_raw, raw)
+
+        # Fallback posicional: cuando hay position (end/beginning) y tenemos
+        # book_id concreto, añadir summaries sin filtro de posición para
+        # cubrir el caso donde el summary "end" no tiene la info específica.
+        # También añadir chunks del libro sin filtro para que el reranker elija.
+        if classification["position"] and book_id_for_summary and not summaries_raw:
+            fallback_sums = search_summaries_hybrid(
+                client, query_en, limit=3,
+                book_id=book_id_for_summary,
+                position=None,
+                alpha=0.85,
+            )
+            if fallback_sums:
+                print(f"  Summaries fallback (sin posición): {len(fallback_sums)}")
+                raw = _merge(fallback_sums, raw)
+
+    if not raw:
+        print("  Sin resultados")
+        return []
+
+    # Filtrar
+    raw = [c for c in raw if not _is_junk(c)]
+    raw = [c for c in raw if _score(c) >= MIN_SCORE]
+
+    if force_global:
+        scope_ids = _expand_scope_ids(raw, scope_ids)
+
+    # Después de expand_scope_ids, los libros incorporados al scope
+    # ya no están limitados por FOREIGN_CAP — se tratan como scope propio.
+    raw = _cap_foreign(raw, scope_ids)
+    raw.sort(key=_score, reverse=True)
+
+    print(f"  Tras filtros: {len(raw)} chunks")
+    for c in raw[:5]:
+        title = (c.get("book") or [{}])[0].get("title", "?")
+        idx   = c.get("chunk_index", c.get("summary_index", "?"))
+        src   = "SUM" if c.get("summary_index") is not None else "CHK"
+        print(f"    [{src}][{title}] idx={idx} score={_score(c):.4f} | "
+              f"{c.get('content', '')[:60]}")
+
+    if not raw:
+        return []
+
+    # Vecinos controlados
+    chunks_only = [c for c in raw if c.get("summary_index") is None]
+
+    if classification["type"] != "summary":
+        chunks_only = _expand_top_chunks(client, chunks_only)
+
+    if summaries_raw:
+        expanded = _merge(summaries_raw, chunks_only)
+    else:
+        expanded = chunks_only
+
+    # Garantizar representación del scope si hint_only
+    if hint_only and scope_ids:
+        in_exp = {_book_id(c) for c in expanded}
+        for sid in scope_ids:
+            if sid not in in_exp:
+                fallback = sorted(
+                    [c for c in raw if _book_id(c) == sid],
+                    key=_score, reverse=True
+                )[:2]
+                expanded = _merge(expanded, fallback)
+                if fallback:
+                    print(f"  Representación forzada: +{len(fallback)} chunks de {sid[:8]}")
+
+    expanded.sort(key=_score, reverse=True)
+
+    # Re-rank (reemplaza tu sección 10 y 11 con esto)
+    preferred = scope_ids if hint_only else None
+    
+    # Separar summaries y chunks para proteger los summaries del reranker
+    sums_to_keep = [c for c in expanded if c.get("summary_index") is not None]
+    chunks_to_rank = [c for c in expanded if c.get("summary_index") is None]
+    
+    reranked_chunks = _rerank(query_en, chunks_to_rank[:MAX_CHUNKS_LLM + 3], preferred_ids=preferred)
+    
+    # Poner los summaries siempre primero, luego los chunks rerankeados
+    final_list = _merge(sums_to_keep, reranked_chunks)
+    
+    # Retornar
+    return _limit(final_list)

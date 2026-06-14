@@ -111,8 +111,10 @@ def _split_into_summary_blocks(text: str) -> list[tuple[str, str]]:
     return blocks
 
 
-# Llama a la API de Groq para resumir un bloque de texto del libro con enfoque en hechos y personajes
-def _summarize_block(raw_text: str, title: str, author: str) -> str:
+# Llama a la API de Groq para resumir un bloque de texto del libro con enfoque en hechos y personajes.
+# Si position="end", toma las últimas 5000 palabras del bloque en lugar de las primeras,
+# para asegurar que el resumen cubra el desenlace real del libro.
+def _summarize_block(raw_text: str, title: str, author: str, position: str = "middle") -> str:
     groq_api_key = os.environ.get("GROQ_API_KEY")
 
     # Si no hay clave de API usa las primeras 250 palabras como fallback
@@ -120,8 +122,12 @@ def _summarize_block(raw_text: str, title: str, author: str) -> str:
         print("  GROQ_API_KEY no configurada, usando fallback de 250 palabras")
         return " ".join(raw_text.split()[:250])
 
-    # Limita el texto enviado a la API a las primeras 5000 palabras
-    excerpt = " ".join(raw_text.split()[:5000])
+    # Para bloques "end" toma las últimas 5000 palabras para cubrir el desenlace real
+    words = raw_text.split()
+    if position == "end":
+        excerpt = " ".join(words[-5000:])
+    else:
+        excerpt = " ".join(words[:5000])
 
     try:
         response = requests.post(
@@ -275,7 +281,8 @@ def upload_book(client: weaviate.Client, txt_path: str) -> dict:
 
     for idx, (block_text, position) in enumerate(blocks):
         print(f"    Resumiendo bloque {idx + 1}/{len(blocks)} [{position}]...")
-        summarized = _summarize_block(block_text, title, author)
+        # Se pasa position para que los bloques "end" usen las últimas 5000 palabras
+        summarized = _summarize_block(block_text, title, author, position=position)
 
         sid = str(uuid.uuid4())
         client.data_object.create(
@@ -563,7 +570,7 @@ def list_books(client: weaviate.Client) -> list[dict]:
         .with_limit(100)
         .do()
     )
-    return result.get("data", {}).get("Get", {}).get("Book", [])
+    return result.get("data", {}).get("Get", {}).get("Book", []) or []
 
 
 # Elimina un libro completo de Weaviate incluyendo todos sus chunks y resumenes

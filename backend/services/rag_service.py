@@ -17,11 +17,8 @@ MODEL_NAME   = "llama-3.3-70b-versatile"
 MAX_HISTORY  = 6
 
 
+# Agrupa chunks por libro ordenados por indice; el libro con mayor score queda primero
 def build_context(chunks: list[dict]) -> str:
-    """
-    Agrupa chunks por libro ordenados por indice.
-    El libro con mayor score aparece primero en el contexto del LLM.
-    """
     seen_books: list[str] = []
     groups: dict[str, list] = defaultdict(list)
     for chunk in chunks:
@@ -44,12 +41,9 @@ def build_context(chunks: list[dict]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+# Construye el prompt final; solo incluye preguntas anteriores, nunca respuestas
+# para evitar que el LLM tome como verdad respuestas previas que pueden estar mal
 def build_prompt(context: str, question: str, history=None) -> str:
-    """
-    Construye el prompt para el LLM.
-    Solo incluye preguntas del historial, nunca respuestas anteriores,
-    porque las respuestas previas pueden estar mal y el LLM las toma como verdad.
-    """
     history_text = ""
     if history:
         recent_questions = [
@@ -64,6 +58,20 @@ def build_prompt(context: str, question: str, history=None) -> str:
                 + "\n\n"
             )
 
+    # Detecta si la pregunta involucra multiples libros para activar la regla de comparacion
+    books_in_context = set()
+    for line in context.splitlines():
+        if line.startswith("BOOK: "):
+            books_in_context.add(line[6:].strip())
+
+    comparison_rule = ""
+    if len(books_in_context) >= 2:
+        comparison_rule = (
+            "5b. If the question compares two books or characters from different books, "
+            "structure your answer addressing both sides explicitly. "
+            "Do not skip one side because it has fewer fragments.\n"
+        )
+
     return (
         "You are a literary assistant. Answer questions using ONLY the book fragments below.\n\n"
         "RULES:\n"
@@ -73,6 +81,7 @@ def build_prompt(context: str, question: str, history=None) -> str:
         "4. Read ALL fragments before answering, the answer may be near the end.\n"
         "5. If a fragment explicitly describes an event (death, blinding, betrayal), "
         "state it clearly. Do not say it is not mentioned if it appears anywhere.\n"
+        f"{comparison_rule}"
         "6. If the fragments do not contain the answer, say exactly: "
         "'The fragments provided do not cover this.' and nothing more.\n\n"
         f"{history_text}"
@@ -81,11 +90,8 @@ def build_prompt(context: str, question: str, history=None) -> str:
     )
 
 
+# Pipeline RAG completo con streaming; acepta chunks prefetched para no repetir el retrieval
 def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
-    """
-    Pipeline RAG completo con streaming token a token.
-    Acepta chunks prefetched para no repetir el retrieval si ya se hizo antes.
-    """
     print(f"\n{'='*50}")
     print(f"Pregunta: {question}")
 
@@ -164,6 +170,6 @@ def ask_rag_stream(question: str, history=None, prefetched_chunks=None):
         yield "Error inesperado."
 
 
+# Version sincrona del pipeline, util para tests o endpoints GET
 def ask_rag(question: str, history=None) -> str:
-    """Version sincrona del pipeline, util para tests o el endpoint GET."""
     return "".join(ask_rag_stream(question, history))
