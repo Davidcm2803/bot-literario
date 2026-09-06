@@ -31,7 +31,7 @@ export function DemoNotice() {
         }}
       >
         <h2 style={{ marginTop: 0, fontSize: "1.25rem" }}>
-          👋 Bienvenido a mi Bot Literario
+          Bienvenido a mi Bot Literario
         </h2>
         <p style={{ lineHeight: 1.5, color: "#ccc" }}>
           Este es uno de mis proyectos favoritos: un sistema RAG (Retrieval-Augmented
